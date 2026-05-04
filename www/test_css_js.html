@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSS + JS Animation Test - JustServer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: monospace;
+            background: #0a0a0a;
+            color: #eee;
+            overflow: hidden;
+            height: 100vh;
+        }
+        .controls {
+            position: fixed;
+            top: 1rem;
+            left: 1rem;
+            z-index: 10;
+            background: rgba(0,0,0,0.8);
+            padding: 1rem;
+            border-radius: 8px;
+            border: 1px solid #333;
+        }
+        .controls h2 { color: #ff6b6b; font-size: 1rem; margin-bottom: 0.5rem; }
+        button {
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 0.4rem 0.8rem;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 0.2rem;
+            font-family: monospace;
+        }
+        button:hover { background: #444; }
+        button.active { background: #ff6b6b; border-color: #ff6b6b; }
+        #canvas { display: block; }
+        .fps-counter {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            background: rgba(0,0,0,0.8);
+            color: #00ff88;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            font-size: 1.2rem;
+            border: 1px solid #333;
+        }
+
+        /* CSS Animation test elements */
+        .css-anim-container {
+            position: fixed;
+            bottom: 1rem;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 1rem;
+        }
+        .css-box {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            animation: bounce 1s ease-in-out infinite;
+        }
+        .css-box:nth-child(1) { background: #ff6b6b; animation-delay: 0s; }
+        .css-box:nth-child(2) { background: #feca57; animation-delay: 0.1s; }
+        .css-box:nth-child(3) { background: #48dbfb; animation-delay: 0.2s; }
+        .css-box:nth-child(4) { background: #ff9ff3; animation-delay: 0.3s; }
+        .css-box:nth-child(5) { background: #00d2d3; animation-delay: 0.4s; }
+
+        @keyframes bounce {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-30px); }
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+
+    <div class="controls">
+        <h2>JS Animation Engine</h2>
+        <button class="active" onclick="setMode('particles')" id="btn-particles">Particles</button>
+        <button onclick="setMode('waves')" id="btn-waves">Waves</button>
+        <button onclick="setMode('matrix')" id="btn-matrix">Matrix</button>
+        <button onclick="setMode('starfield')" id="btn-starfield">Starfield</button>
+    </div>
+
+    <div class="fps-counter" id="fps">0 FPS</div>
+
+    <div class="css-anim-container">
+        <div class="css-box"></div>
+        <div class="css-box"></div>
+        <div class="css-box"></div>
+        <div class="css-box"></div>
+        <div class="css-box"></div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        let W, H;
+        let mode = 'particles';
+        let frameCount = 0;
+        let lastFpsUpdate = performance.now();
+
+        function resize() {
+            W = canvas.width = window.innerWidth;
+            H = canvas.height = window.innerHeight;
+        }
+        resize();
+        window.addEventListener('resize', resize);
+
+        function setMode(m) {
+            mode = m;
+            document.querySelectorAll('.controls button').forEach(b => b.classList.remove('active'));
+            document.getElementById('btn-' + m)?.classList.add('active');
+            initMode();
+        }
+
+        // === Particles ===
+        let particles = [];
+        function initParticles() {
+            particles = [];
+            for (let i = 0; i < 200; i++) {
+                particles.push({
+                    x: Math.random() * W,
+                    y: Math.random() * H,
+                    vx: (Math.random() - 0.5) * 2,
+                    vy: (Math.random() - 0.5) * 2,
+                    r: Math.random() * 3 + 1,
+                    color: `hsl(${Math.random() * 360}, 70%, 60%)`,
+                });
+            }
+        }
+
+        function drawParticles() {
+            ctx.fillStyle = 'rgba(10,10,10,0.1)';
+            ctx.fillRect(0, 0, W, H);
+
+            for (const p of particles) {
+                p.x += p.vx;
+                p.y += p.vy;
+                if (p.x < 0 || p.x > W) p.vx *= -1;
+                if (p.y < 0 || p.y > H) p.vy *= -1;
+
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+                ctx.fillStyle = p.color;
+                ctx.fill();
+            }
+
+            // Draw connections
+            ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+            ctx.lineWidth = 0.5;
+            for (let i = 0; i < particles.length; i++) {
+                for (let j = i + 1; j < particles.length; j++) {
+                    const dx = particles[i].x - particles[j].x;
+                    const dy = particles[i].y - particles[j].y;
+                    if (dx * dx + dy * dy < 10000) {
+                        ctx.beginPath();
+                        ctx.moveTo(particles[i].x, particles[i].y);
+                        ctx.lineTo(particles[j].x, particles[j].y);
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+
+        // === Waves ===
+        let waveOffset = 0;
+        function drawWaves() {
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, W, H);
+            waveOffset += 0.02;
+
+            for (let layer = 0; layer < 5; layer++) {
+                ctx.beginPath();
+                ctx.moveTo(0, H);
+                const hue = layer * 60;
+                ctx.strokeStyle = `hsla(${hue}, 70%, 50%, 0.8)`;
+                ctx.lineWidth = 2;
+
+                for (let x = 0; x <= W; x += 5) {
+                    const y = H / 2 +
+                        Math.sin(x * 0.01 + waveOffset + layer) * 50 +
+                        Math.sin(x * 0.005 + waveOffset * 0.5) * 30 +
+                        layer * 40 - 100;
+                    if (x === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+            }
+        }
+
+        // === Matrix ===
+        let matrixColumns = [];
+        function initMatrix() {
+            const fontSize = 14;
+            const cols = Math.floor(W / fontSize);
+            matrixColumns = Array(cols).fill(0);
+        }
+
+        function drawMatrix() {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+            ctx.fillRect(0, 0, W, H);
+
+            ctx.fillStyle = '#0f0';
+            ctx.font = '14px monospace';
+
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@#$%^&*()';
+            for (let i = 0; i < matrixColumns.length; i++) {
+                const char = chars[Math.floor(Math.random() * chars.length)];
+                ctx.fillText(char, i * 14, matrixColumns[i] * 14);
+
+                if (matrixColumns[i] * 14 > H && Math.random() > 0.975) {
+                    matrixColumns[i] = 0;
+                }
+                matrixColumns[i]++;
+            }
+        }
+
+        // === Starfield ===
+        let stars = [];
+        function initStarfield() {
+            stars = [];
+            for (let i = 0; i < 500; i++) {
+                stars.push({
+                    x: Math.random() * W - W / 2,
+                    y: Math.random() * H - H / 2,
+                    z: Math.random() * W,
+                });
+            }
+        }
+
+        function drawStarfield() {
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, W, H);
+
+            ctx.save();
+            ctx.translate(W / 2, H / 2);
+
+            for (const star of stars) {
+                star.z -= 5;
+                if (star.z <= 0) {
+                    star.x = Math.random() * W - W / 2;
+                    star.y = Math.random() * H - H / 2;
+                    star.z = W;
+                }
+
+                const sx = (star.x / star.z) * W;
+                const sy = (star.y / star.z) * H;
+                const r = Math.max(0.5, (1 - star.z / W) * 3);
+
+                ctx.beginPath();
+                ctx.arc(sx, sy, r, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255,255,255,${1 - star.z / W})`;
+                ctx.fill();
+            }
+
+            ctx.restore();
+        }
+
+        function initMode() {
+            switch (mode) {
+                case 'particles': initParticles(); break;
+                case 'matrix': initMatrix(); break;
+                case 'starfield': initStarfield(); break;
+            }
+        }
+
+        function animate() {
+            switch (mode) {
+                case 'particles': drawParticles(); break;
+                case 'waves': drawWaves(); break;
+                case 'matrix': drawMatrix(); break;
+                case 'starfield': drawStarfield(); break;
+            }
+
+            frameCount++;
+            const now = performance.now();
+            if (now - lastFpsUpdate >= 1000) {
+                document.getElementById('fps').textContent = frameCount + ' FPS';
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
+
+            requestAnimationFrame(animate);
+        }
+
+        initMode();
+        animate();
+    </script>
+</body>
+</html>

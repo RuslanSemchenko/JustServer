@@ -1,0 +1,29 @@
+# Build directories
+build/
+cmake-build-*/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# Binary
+justserver
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# TLS certificates (never commit these)
+*.pem
+*.key
+*.crt

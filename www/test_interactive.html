@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive JS Test - JustServer</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            padding: 2rem;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 { color: #58a6ff; }
+        .panel {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 1.5rem;
+            margin: 1rem 0;
+        }
+        .panel h2 { color: #8b949e; font-size: 1rem; margin-bottom: 1rem; }
+        input, textarea {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            color: #c9d1d9;
+            padding: 0.5rem;
+            border-radius: 4px;
+            width: 100%;
+            font-family: monospace;
+        }
+        textarea { min-height: 100px; resize: vertical; }
+        button {
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 0.5rem 0.25rem;
+        }
+        button:hover { background: #2ea043; }
+        button.danger { background: #da3633; }
+        button.danger:hover { background: #f85149; }
+        .output {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 1rem;
+            margin-top: 0.5rem;
+            min-height: 40px;
+            white-space: pre-wrap;
+            font-size: 0.85rem;
+        }
+        .pass { color: #3fb950; }
+        .fail { color: #f85149; }
+        .info { color: #58a6ff; }
+        #todo-list li {
+            padding: 0.3rem 0;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        #todo-list input[type="checkbox"] { accent-color: #238636; }
+        .completed { text-decoration: line-through; color: #484f58; }
+    </style>
+</head>
+<body>
+    <h1>Interactive JavaScript Test Suite</h1>
+    <p class="info">Pure HTML+JS application served by JustServer</p>
+
+    <!-- Todo App -->
+    <div class="panel">
+        <h2>Mini Todo App (LocalStorage persistence)</h2>
+        <div style="display: flex; gap: 0.5rem;">
+            <input type="text" id="todo-input" placeholder="Add a task...">
+            <button onclick="addTodo()">Add</button>
+        </div>
+        <ul id="todo-list"></ul>
+        <button class="danger" onclick="clearTodos()">Clear All</button>
+    </div>
+
+    <!-- JSON Editor -->
+    <div class="panel">
+        <h2>JSON Validator</h2>
+        <textarea id="json-input" placeholder='{"key": "value"}'></textarea>
+        <button onclick="validateJSON()">Validate</button>
+        <button onclick="formatJSON()">Format</button>
+        <div class="output" id="json-output"></div>
+    </div>
+
+    <!-- Performance Benchmark -->
+    <div class="panel">
+        <h2>JS Performance Benchmark</h2>
+        <button onclick="runBenchmark()">Run Benchmark</button>
+        <div class="output" id="bench-output">Click to run benchmarks</div>
+    </div>
+
+    <!-- Crypto Test -->
+    <div class="panel">
+        <h2>Web Crypto API Test</h2>
+        <input type="text" id="crypto-input" placeholder="Text to hash" value="JustServer">
+        <button onclick="runCryptoTest()">Hash (SHA-256)</button>
+        <div class="output" id="crypto-output"></div>
+    </div>
+
+    <script>
+        // === Todo App ===
+        let todos = JSON.parse(localStorage.getItem('js_todos') || '[]');
+
+        function renderTodos() {
+            const list = document.getElementById('todo-list');
+            list.innerHTML = '';
+            todos.forEach((todo, i) => {
+                const li = document.createElement('li');
+                li.innerHTML = `
+                    <input type="checkbox" ${todo.done ? 'checked' : ''} onchange="toggleTodo(${i})">
+                    <span class="${todo.done ? 'completed' : ''}">${todo.text}</span>
+                `;
+                list.appendChild(li);
+            });
+            localStorage.setItem('js_todos', JSON.stringify(todos));
+        }
+
+        function addTodo() {
+            const input = document.getElementById('todo-input');
+            if (input.value.trim()) {
+                todos.push({ text: input.value.trim(), done: false });
+                input.value = '';
+                renderTodos();
+            }
+        }
+
+        function toggleTodo(i) {
+            todos[i].done = !todos[i].done;
+            renderTodos();
+        }
+
+        function clearTodos() {
+            todos = [];
+            renderTodos();
+        }
+
+        document.getElementById('todo-input').addEventListener('keypress', e => {
+            if (e.key === 'Enter') addTodo();
+        });
+
+        renderTodos();
+
+        // === JSON Validator ===
+        function validateJSON() {
+            const input = document.getElementById('json-input').value;
+            const output = document.getElementById('json-output');
+            try {
+                JSON.parse(input);
+                output.innerHTML = '<span class="pass">Valid JSON</span>';
+            } catch (e) {
+                output.innerHTML = '<span class="fail">Invalid JSON: ' + e.message + '</span>';
+            }
+        }
+
+        function formatJSON() {
+            const input = document.getElementById('json-input');
+            const output = document.getElementById('json-output');
+            try {
+                const parsed = JSON.parse(input.value);
+                input.value = JSON.stringify(parsed, null, 2);
+                output.innerHTML = '<span class="pass">Formatted</span>';
+            } catch (e) {
+                output.innerHTML = '<span class="fail">Cannot format: ' + e.message + '</span>';
+            }
+        }
+
+        // === Benchmark ===
+        function runBenchmark() {
+            const output = document.getElementById('bench-output');
+            output.textContent = 'Running benchmarks...\n';
+
+            const results = [];
+
+            // Array operations
+            let start = performance.now();
+            const arr = Array.from({ length: 1000000 }, (_, i) => i);
+            arr.sort(() => Math.random() - 0.5);
+            let elapsed = performance.now() - start;
+            results.push(`Array shuffle (1M): ${elapsed.toFixed(2)}ms`);
+
+            // Object creation
+            start = performance.now();
+            const objects = [];
+            for (let i = 0; i < 100000; i++) {
+                objects.push({ id: i, name: 'item_' + i, value: Math.random() });
+            }
+            elapsed = performance.now() - start;
+            results.push(`Object creation (100K): ${elapsed.toFixed(2)}ms`);
+
+            // String concatenation
+            start = performance.now();
+            let str = '';
+            for (let i = 0; i < 100000; i++) {
+                str += 'x';
+            }
+            elapsed = performance.now() - start;
+            results.push(`String concat (100K): ${elapsed.toFixed(2)}ms`);
+
+            // Map operations
+            start = performance.now();
+            const map = new Map();
+            for (let i = 0; i < 100000; i++) {
+                map.set('key_' + i, i);
+            }
+            for (let i = 0; i < 100000; i++) {
+                map.get('key_' + i);
+            }
+            elapsed = performance.now() - start;
+            results.push(`Map set+get (100K): ${elapsed.toFixed(2)}ms`);
+
+            // Regex
+            start = performance.now();
+            const regex = /(\d{1,3}\.){3}\d{1,3}/g;
+            const text = '192.168.1.1 some text 10.0.0.1 more text 172.16.0.1'.repeat(10000);
+            const matches = text.match(regex);
+            elapsed = performance.now() - start;
+            results.push(`Regex matching: ${elapsed.toFixed(2)}ms (${matches.length} matches)`);
+
+            output.textContent = results.join('\n');
+        }
+
+        // === Crypto ===
+        async function runCryptoTest() {
+            const input = document.getElementById('crypto-input').value;
+            const output = document.getElementById('crypto-output');
+
+            try {
+                const encoder = new TextEncoder();
+                const data = encoder.encode(input);
+                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+                output.innerHTML = `<span class="info">Input:</span> ${input}\n<span class="info">SHA-256:</span> <span class="pass">${hashHex}</span>`;
+            } catch (e) {
+                output.innerHTML = '<span class="fail">Crypto API error: ' + e.message + '</span>';
+            }
+        }
+    </script>
+</body>
+</html>

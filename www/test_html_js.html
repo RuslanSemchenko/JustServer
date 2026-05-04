@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTML + JS Test - JustServer</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 2rem;
+        }
+        .test-section {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .pass { color: #00ff88; }
+        .fail { color: #ff4444; }
+        .info { color: #4488ff; }
+        h1 { color: #00d2ff; margin-bottom: 1rem; }
+        h2 { color: #888; margin-bottom: 0.5rem; }
+        #results { margin-top: 1rem; }
+        .result-line {
+            padding: 0.3rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        button {
+            background: #3a7bd5;
+            color: white;
+            border: none;
+            padding: 0.5rem 1.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            margin: 0.5rem 0.5rem 0.5rem 0;
+        }
+        button:hover { background: #2a6bc5; }
+        canvas { border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <h1>HTML + JavaScript Test Page</h1>
+    <p class="info">Testing static HTML serving with embedded JavaScript functionality</p>
+
+    <div class="test-section">
+        <h2>DOM Manipulation Tests</h2>
+        <div id="dom-test-area"></div>
+        <button onclick="runDOMTests()">Run DOM Tests</button>
+    </div>
+
+    <div class="test-section">
+        <h2>Canvas Rendering Test</h2>
+        <canvas id="test-canvas" width="400" height="200"></canvas>
+        <br>
+        <button onclick="runCanvasTest()">Draw Test Pattern</button>
+    </div>
+
+    <div class="test-section">
+        <h2>Fetch API Test</h2>
+        <button onclick="runFetchTest()">Test Fetch API</button>
+        <div id="fetch-results"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>Web Workers Test</h2>
+        <button onclick="runWorkerTest()">Test Web Worker</button>
+        <div id="worker-results"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>LocalStorage Test</h2>
+        <button onclick="runStorageTest()">Test LocalStorage</button>
+        <div id="storage-results"></div>
+    </div>
+
+    <div id="results">
+        <h2>Test Results</h2>
+        <div id="result-list"></div>
+    </div>
+
+    <script>
+        const results = [];
+
+        function addResult(name, passed, detail) {
+            results.push({ name, passed, detail });
+            const list = document.getElementById('result-list');
+            const div = document.createElement('div');
+            div.className = 'result-line';
+            div.innerHTML = `<span class="${passed ? 'pass' : 'fail'}">${passed ? 'PASS' : 'FAIL'}</span> ${name} ${detail ? '- ' + detail : ''}`;
+            list.appendChild(div);
+        }
+
+        function runDOMTests() {
+            const area = document.getElementById('dom-test-area');
+
+            // Test 1: Create element
+            try {
+                const el = document.createElement('p');
+                el.textContent = 'Dynamic element created at ' + new Date().toISOString();
+                el.style.color = '#00ff88';
+                area.appendChild(el);
+                addResult('DOM createElement', true);
+            } catch (e) {
+                addResult('DOM createElement', false, e.message);
+            }
+
+            // Test 2: Query selector
+            try {
+                const found = document.querySelector('#dom-test-area');
+                addResult('DOM querySelector', found !== null);
+            } catch (e) {
+                addResult('DOM querySelector', false, e.message);
+            }
+
+            // Test 3: Template literals
+            try {
+                const a = 5, b = 10;
+                const result = `${a} + ${b} = ${a + b}`;
+                addResult('Template literals', result === '5 + 10 = 15', result);
+            } catch (e) {
+                addResult('Template literals', false, e.message);
+            }
+
+            // Test 4: Destructuring
+            try {
+                const { x, y } = { x: 1, y: 2 };
+                addResult('Destructuring', x === 1 && y === 2);
+            } catch (e) {
+                addResult('Destructuring', false, e.message);
+            }
+
+            // Test 5: Async/Await support
+            try {
+                const asyncFn = async () => 42;
+                asyncFn().then(v => addResult('Async/Await', v === 42));
+            } catch (e) {
+                addResult('Async/Await', false, e.message);
+            }
+        }
+
+        function runCanvasTest() {
+            const canvas = document.getElementById('test-canvas');
+            const ctx = canvas.getContext('2d');
+
+            try {
+                // Background
+                ctx.fillStyle = '#1a1a2e';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                // Gradient bar
+                const grad = ctx.createLinearGradient(0, 0, canvas.width, 0);
+                grad.addColorStop(0, '#00d2ff');
+                grad.addColorStop(0.5, '#3a7bd5');
+                grad.addColorStop(1, '#00ff88');
+                ctx.fillStyle = grad;
+                ctx.fillRect(20, 20, canvas.width - 40, 30);
+
+                // Circles
+                for (let i = 0; i < 5; i++) {
+                    ctx.beginPath();
+                    ctx.arc(60 + i * 75, 120, 25, 0, Math.PI * 2);
+                    ctx.fillStyle = `hsl(${i * 60}, 70%, 50%)`;
+                    ctx.fill();
+                }
+
+                // Text
+                ctx.fillStyle = '#fff';
+                ctx.font = '14px monospace';
+                ctx.fillText('Canvas rendering OK - JustServer', 20, 180);
+
+                addResult('Canvas 2D rendering', true);
+            } catch (e) {
+                addResult('Canvas 2D rendering', false, e.message);
+            }
+        }
+
+        function runFetchTest() {
+            const area = document.getElementById('fetch-results');
+
+            fetch(window.location.pathname)
+                .then(resp => {
+                    addResult('Fetch API status', resp.ok, 'HTTP ' + resp.status);
+                    return resp.text();
+                })
+                .then(text => {
+                    addResult('Fetch API body', text.length > 0, text.length + ' bytes');
+                    area.innerHTML = '<span class="pass">Fetch completed: ' + text.length + ' bytes received</span>';
+                })
+                .catch(err => {
+                    addResult('Fetch API', false, err.message);
+                    area.innerHTML = '<span class="fail">Fetch failed: ' + err.message + '</span>';
+                });
+        }
+
+        function runWorkerTest() {
+            const area = document.getElementById('worker-results');
+
+            try {
+                const blob = new Blob([`
+                    self.onmessage = function(e) {
+                        let sum = 0;
+                        for (let i = 0; i < e.data; i++) sum += i;
+                        self.postMessage(sum);
+                    };
+                `], { type: 'application/javascript' });
+
+                const worker = new Worker(URL.createObjectURL(blob));
+                worker.onmessage = function(e) {
+                    addResult('Web Worker', true, 'Sum result: ' + e.data);
+                    area.innerHTML = '<span class="pass">Worker result: ' + e.data + '</span>';
+                    worker.terminate();
+                };
+                worker.onerror = function(e) {
+                    addResult('Web Worker', false, e.message);
+                    area.innerHTML = '<span class="fail">Worker error: ' + e.message + '</span>';
+                };
+                worker.postMessage(1000000);
+            } catch (e) {
+                addResult('Web Worker', false, e.message);
+                area.innerHTML = '<span class="fail">Workers not supported: ' + e.message + '</span>';
+            }
+        }
+
+        function runStorageTest() {
+            const area = document.getElementById('storage-results');
+
+            try {
+                const key = 'js_test_' + Date.now();
+                const value = 'JustServer_OK';
+
+                localStorage.setItem(key, value);
+                const retrieved = localStorage.getItem(key);
+                localStorage.removeItem(key);
+
+                const passed = retrieved === value;
+                addResult('LocalStorage', passed, passed ? 'Read/Write OK' : 'Mismatch');
+                area.innerHTML = `<span class="${passed ? 'pass' : 'fail'}">Storage: ${passed ? 'OK' : 'FAIL'}</span>`;
+            } catch (e) {
+                addResult('LocalStorage', false, e.message);
+                area.innerHTML = '<span class="fail">Storage error: ' + e.message + '</span>';
+            }
+        }
+
+        // Auto-run basic tests
+        document.addEventListener('DOMContentLoaded', () => {
+            addResult('Page loaded', true, document.title);
+            addResult('JavaScript execution', true, 'ES6+ supported');
+        });
+    </script>
+</body>
+</html>

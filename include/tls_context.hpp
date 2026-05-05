@@ -6,6 +6,12 @@
 
 namespace js {
 
+enum class NegotiatedProtocol {
+    HTTP_1_1,
+    HTTP_2,
+    UNKNOWN,
+};
+
 class TLSContext {
 public:
     TLSContext();
@@ -21,10 +27,19 @@ public:
     // Wrap a raw socket fd into an SSL connection
     SSL* wrap_socket(int fd);
 
+    // Get the negotiated ALPN protocol after handshake
+    static NegotiatedProtocol get_negotiated_protocol(SSL* ssl);
+
     // Get the raw SSL_CTX
     SSL_CTX* native() const { return ctx_; }
 
 private:
+    // ALPN selection callback
+    static int alpn_select_callback(SSL* ssl, const unsigned char** out,
+                                    unsigned char* outlen,
+                                    const unsigned char* in, unsigned int inlen,
+                                    void* arg);
+
     SSL_CTX* ctx_ = nullptr;
 };
 

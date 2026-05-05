@@ -27,3 +27,5 @@ Thumbs.db
 *.pem
 *.key
 *.crt
+build/
+build-fuzz/

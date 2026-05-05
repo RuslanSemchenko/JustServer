@@ -3,6 +3,9 @@
 #include "config.hpp"
 #include "tls_context.hpp"
 #include "http_parser.hpp"
+#include "http2.hpp"
+#include "websocket.hpp"
+#include "grpc_handler.hpp"
 #include "waf.hpp"
 #include "ddos_guard.hpp"
 #include "file_handler.hpp"
@@ -37,6 +40,16 @@ private:
 
     // Route request to appropriate handler
     HttpResponse route_request(const HttpRequest& req);
+
+    // Apply security headers to response
+    void apply_security_headers(HttpResponse& resp) const;
+
+    // Handle HTTP/2 connection
+    void handle_h2_connection(SSL* ssl, int client_fd, const std::string& client_ip);
+
+    // Handle WebSocket upgrade
+    void handle_websocket(SSL* ssl, int client_fd, const std::string& client_ip,
+                          const HttpRequest& req);
 
     // Check if request is for a PHP file
     bool is_php_request(std::string_view path) const;

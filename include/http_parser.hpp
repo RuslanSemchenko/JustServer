@@ -68,6 +68,7 @@ public:
 private:
     bool parse_request_line(std::string_view line);
     bool parse_header_line(std::string_view line);
+    bool validate_headers();
     void parse_uri();
 
     HttpRequest request_;
@@ -75,8 +76,19 @@ private:
     std::string error_;
     bool headers_done_ = false;
     size_t content_length_ = 0;
+    bool has_content_length_ = false;
+    bool has_transfer_encoding_chunked_ = false;
+    bool use_chunked_ = false;
     size_t body_received_ = 0;
     size_t body_start_offset_ = 0;
+
+    // Duplicate Content-Length detection
+    int content_length_count_ = 0;
+
+    // Chunked transfer encoding state
+    bool chunk_done_ = false;
+    size_t current_chunk_remaining_ = 0;
+    bool reading_chunk_size_ = true;
 };
 
 } // namespace js

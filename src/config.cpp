@@ -55,7 +55,20 @@ Config Config::load_from_file(const std::string& path) {
         else if (key == "fastcgi_socket") config.fastcgi_socket = value;
         else if (key == "fastcgi_enabled") config.fastcgi_enabled = (value == "true" || value == "1");
         else if (key == "waf_enabled") config.waf_enabled = (value == "true" || value == "1");
+        else if (key == "waf_body_inspection_limit") config.waf_body_inspection_limit = static_cast<size_t>(std::stoi(value));
         else if (key == "log_level") config.log_level = value;
+        // Security headers
+        else if (key == "security_headers_enabled") config.security_headers.enabled = (value == "true" || value == "1");
+        else if (key == "csp_enabled") config.security_headers.csp_enabled = (value == "true" || value == "1");
+        else if (key == "csp_value") config.security_headers.csp_value = value;
+        else if (key == "hsts_enabled") config.security_headers.hsts_enabled = (value == "true" || value == "1");
+        else if (key == "hsts_value") config.security_headers.hsts_value = value;
+        else if (key == "xcto_enabled") config.security_headers.xcto_enabled = (value == "true" || value == "1");
+        else if (key == "xxss_enabled") config.security_headers.xxss_enabled = (value == "true" || value == "1");
+        else if (key == "xfo_enabled") config.security_headers.xfo_enabled = (value == "true" || value == "1");
+        else if (key == "xfo_value") config.security_headers.xfo_value = value;
+        else if (key == "referrer_policy_enabled") config.security_headers.referrer_policy_enabled = (value == "true" || value == "1");
+        else if (key == "referrer_policy_value") config.security_headers.referrer_policy_value = value;
     }
 
     return config;

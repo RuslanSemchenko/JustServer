@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & Test (Clang 22, ${{ matrix.build_type }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        build_type: [Release, Debug]
+        include:
+          - build_type: Debug
+            sanitize: ON
+          - build_type: Release
+            sanitize: OFF
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config
+
+      - name: Install Clang 22
+        run: |
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
+          tar xf LLVM-22.1.4-Linux-X64.tar.xz
+          echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          cmake \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DBUILD_TESTS=ON \
+            -DBUILD_FUZZ=OFF \
+            -DSANITIZE=${{ matrix.sanitize }} \
+            ..
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests
+        run: cd build && ctest --output-on-failure -j$(nproc)
+
+      - name: Run test binary directly
+        run: ./build/justserver_tests
+
+  sanitizer:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config
+
+      - name: Install Clang 22
+        run: |
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
+          tar xf LLVM-22.1.4-Linux-X64.tar.xz
+          echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+
+      - name: Configure with sanitizers
+        run: |
+          mkdir build && cd build
+          cmake \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTS=ON \
+            -DBUILD_FUZZ=OFF \
+            -DSANITIZE=ON \
+            ..
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests under ASan/UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build/justserver_tests
+
+  fuzz:
+    name: Fuzz (5 min smoke test)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config
+
+      - name: Install Clang 22
+        run: |
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
+          tar xf LLVM-22.1.4-Linux-X64.tar.xz
+          echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+
+      - name: Configure fuzz build
+        run: |
+          mkdir build-fuzz && cd build-fuzz
+          cmake \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_FUZZ=ON \
+            ..
+
+      - name: Build fuzz targets
+        run: cmake --build build-fuzz -j$(nproc)
+
+      - name: Fuzz HTTP/1.1 parser (60s)
+        run: timeout 60 ./build-fuzz/fuzz_http_parser -max_len=8192 || true
+
+      - name: Fuzz HTTP/2 + HPACK (60s)
+        run: timeout 60 ./build-fuzz/fuzz_http2 -max_len=16384 || true
+
+      - name: Fuzz WAF engine (60s)
+        run: timeout 60 ./build-fuzz/fuzz_waf -max_len=4096 || true

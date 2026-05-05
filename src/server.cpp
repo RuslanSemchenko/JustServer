@@ -46,10 +46,11 @@ bool Server::start() {
     LOG_INFO("Bind: " + config_.bind_address + ":" + std::to_string(config_.port));
     LOG_INFO("Workers: " + std::to_string(config_.worker_threads));
     LOG_INFO("TLS: " + std::string(config_.tls_enabled ? "enabled (TLS 1.3)" : "disabled"));
-    LOG_INFO("WAF: " + std::string(config_.waf_enabled ? "enabled (with Unicode normalization)" : "disabled"));
+    LOG_INFO("WAF: " + std::string(config_.waf_enabled ? "enabled (RE2 engine, anomaly scoring)" : "disabled"));
     LOG_INFO("FastCGI: " + std::string(config_.fastcgi_enabled ? config_.fastcgi_socket : "disabled"));
     LOG_INFO("Sendfile: enabled (zero-copy for static files)");
-    LOG_INFO("HTTP/2: enabled (frame parsing with HPACK)");
+    LOG_INFO("HTTP/2: enabled (HPACK with Huffman, ALPN negotiation)");
+    LOG_INFO("Security headers: " + std::string(config_.security_headers.enabled ? "enabled (CSP, HSTS, X-Content-Type-Options)" : "disabled"));
     LOG_INFO("Metrics: enabled at /metrics (Prometheus format)");
     LOG_INFO("Hot reload: SIGHUP supported");
 

@@ -156,17 +156,12 @@ HttpParser::State HttpParser::feed(std::span<const char> data) {
             }
         }
 
-        headers_done_ = true;
-
-        // Check for Content-Length
-        auto cl = request_.get_header("Content-Length");
-        if (!cl.empty()) {
-            auto result = std::from_chars(cl.data(), cl.data() + cl.size(), content_length_);
-            if (result.ec != std::errc()) {
-                error_ = "Invalid Content-Length";
-                return State::ERROR;
-            }
+        // Validate headers for request smuggling protection
+        if (!validate_headers()) {
+            return State::ERROR;
         }
+
+        headers_done_ = true;
 
         // Record where the body starts in the buffer
         body_start_offset_ = header_end + 4;
@@ -175,7 +170,65 @@ HttpParser::State HttpParser::feed(std::span<const char> data) {
     }
 
     if (headers_done_) {
-        // Update body tracking from the growing buffer on every feed() call
+        if (use_chunked_) {
+            // Chunked transfer encoding: parse chunks
+            // We accumulate body from chunks until we see a 0-length chunk
+            size_t pos = body_start_offset_;
+            while (pos < buffer_.size() && !chunk_done_) {
+                if (reading_chunk_size_) {
+                    // Look for chunk size line
+                    auto crlf = buffer_.find("\r\n", pos);
+                    if (crlf == std::string::npos) {
+                        return State::INCOMPLETE;
+                    }
+                    std::string_view size_str(buffer_.data() + pos, crlf - pos);
+                    // Parse hex chunk size (ignore extensions after semicolon)
+                    auto semi = size_str.find(';');
+                    if (semi != std::string_view::npos) {
+                        size_str = size_str.substr(0, semi);
+                    }
+                    size_t chunk_size = 0;
+                    auto result = std::from_chars(size_str.data(), size_str.data() + size_str.size(),
+                                                  chunk_size, 16);
+                    if (result.ec != std::errc()) {
+                        error_ = "Invalid chunk size";
+                        return State::ERROR;
+                    }
+                    if (chunk_size == 0) {
+                        chunk_done_ = true;
+                        // Look for trailing \r\n after the 0 chunk
+                        if (crlf + 2 + 2 <= buffer_.size()) {
+                            return State::COMPLETE;
+                        }
+                        return State::INCOMPLETE;
+                    }
+                    current_chunk_remaining_ = chunk_size;
+                    reading_chunk_size_ = false;
+                    pos = crlf + 2;
+                } else {
+                    // Read chunk data
+                    size_t available = buffer_.size() - pos;
+                    size_t to_read = std::min(available, current_chunk_remaining_);
+                    request_.body.append(buffer_.data() + pos, to_read);
+                    current_chunk_remaining_ -= to_read;
+                    pos += to_read;
+                    if (current_chunk_remaining_ == 0) {
+                        // Skip trailing \r\n after chunk data
+                        if (pos + 2 > buffer_.size()) {
+                            return State::INCOMPLETE;
+                        }
+                        pos += 2;
+                        reading_chunk_size_ = true;
+                    }
+                }
+            }
+            // Update body_start_offset_ to track our position
+            body_start_offset_ = pos;
+            if (chunk_done_) return State::COMPLETE;
+            return State::INCOMPLETE;
+        }
+
+        // Content-Length based body reading
         if (body_start_offset_ < buffer_.size()) {
             body_received_ = buffer_.size() - body_start_offset_;
             request_.body = buffer_.substr(body_start_offset_);
@@ -200,11 +253,24 @@ void HttpParser::reset() {
     error_.clear();
     headers_done_ = false;
     content_length_ = 0;
+    has_content_length_ = false;
+    has_transfer_encoding_chunked_ = false;
+    use_chunked_ = false;
     body_received_ = 0;
     body_start_offset_ = 0;
+    content_length_count_ = 0;
+    chunk_done_ = false;
+    current_chunk_remaining_ = 0;
+    reading_chunk_size_ = true;
 }
 
 bool HttpParser::parse_request_line(std::string_view line) {
+    // Reject lines with null bytes
+    if (line.find('\0') != std::string_view::npos) {
+        error_ = "Null byte in request line";
+        return false;
+    }
+
     // METHOD SP URI SP VERSION
     auto sp1 = line.find(' ');
     if (sp1 == std::string_view::npos) {
@@ -234,10 +300,22 @@ bool HttpParser::parse_request_line(std::string_view line) {
     request_.uri = std::string(rest.substr(0, sp2));
     request_.version = std::string(rest.substr(sp2 + 1));
 
+    // Validate HTTP version
+    if (request_.version != "HTTP/1.0" && request_.version != "HTTP/1.1") {
+        error_ = "Unsupported HTTP version: " + request_.version;
+        return false;
+    }
+
     return true;
 }
 
 bool HttpParser::parse_header_line(std::string_view line) {
+    // Reject lines with null bytes
+    if (line.find('\0') != std::string_view::npos) {
+        error_ = "Null byte in header";
+        return false;
+    }
+
     auto colon = line.find(':');
     if (colon == std::string_view::npos) {
         error_ = "Invalid header line";
@@ -247,13 +325,70 @@ bool HttpParser::parse_header_line(std::string_view line) {
     auto name = line.substr(0, colon);
     auto value = line.substr(colon + 1);
 
+    // Reject header names with spaces (HTTP desync vector)
+    if (name.find(' ') != std::string_view::npos || name.find('\t') != std::string_view::npos) {
+        error_ = "Space in header name (request smuggling vector)";
+        return false;
+    }
+
     // Trim whitespace from value
     auto vstart = value.find_first_not_of(" \t");
     if (vstart != std::string_view::npos) {
         value = value.substr(vstart);
     }
+    auto vend = value.find_last_not_of(" \t");
+    if (vend != std::string_view::npos) {
+        value = value.substr(0, vend + 1);
+    }
+
+    // Lowercase name for comparison
+    std::string lower_name(name);
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    // Track Content-Length for smuggling protection
+    if (lower_name == "content-length") {
+        content_length_count_++;
+        if (content_length_count_ > 1) {
+            error_ = "Duplicate Content-Length header (request smuggling attempt)";
+            return false;
+        }
+        has_content_length_ = true;
+        auto result = std::from_chars(value.data(), value.data() + value.size(), content_length_);
+        if (result.ec != std::errc()) {
+            error_ = "Invalid Content-Length value";
+            return false;
+        }
+    }
+
+    // Track Transfer-Encoding
+    if (lower_name == "transfer-encoding") {
+        std::string lower_val(value);
+        std::transform(lower_val.begin(), lower_val.end(), lower_val.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower_val.find("chunked") != std::string::npos) {
+            has_transfer_encoding_chunked_ = true;
+        }
+    }
 
     request_.headers[std::string(name)] = std::string(value);
+    return true;
+}
+
+bool HttpParser::validate_headers() {
+    // Request Smuggling Protection (RFC 7230 Section 3.3.3):
+    // If both Transfer-Encoding and Content-Length are present,
+    // Transfer-Encoding takes priority and Content-Length MUST be ignored.
+    if (has_transfer_encoding_chunked_ && has_content_length_) {
+        // Per RFC 7230: TE takes priority, CL is ignored
+        use_chunked_ = true;
+        content_length_ = 0;
+        has_content_length_ = false;
+    } else if (has_transfer_encoding_chunked_) {
+        use_chunked_ = true;
+    }
+    // If only Content-Length, content_length_ is already set from parse_header_line
+
     return true;
 }
 

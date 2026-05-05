@@ -222,12 +222,13 @@ std::optional<FileHandler::SendfileInfo> FileHandler::resolve_for_sendfile(const
     headers += "Content-Length: ";
     headers += std::to_string(st.st_size);
     headers += "\r\n";
-    headers += "X-Content-Type-Options: nosniff\r\n";
-    headers += "X-Frame-Options: SAMEORIGIN\r\n";
     headers += "Cache-Control: public, max-age=3600\r\n";
     headers += "X-Sendfile: true\r\n";
     headers += "Connection: close\r\n";
-    headers += "\r\n";
+    // NOTE: Security headers (CSP, HSTS, X-Frame-Options, etc.) are injected
+    // by Worker::try_sendfile() before sending, so they respect the config.
+    // Do NOT terminate with \r\n here -- the caller appends headers then terminates.
+
 
     return SendfileInfo{fd, static_cast<size_t>(st.st_size), std::move(mt), std::move(headers)};
 }

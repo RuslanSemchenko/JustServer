@@ -35,16 +35,16 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 - Single reactor thread distributing to worker thread pool
 - Non-blocking accepts with `accept4()` and `SOCK_CLOEXEC`
 
-### io_uring Event Loop (New)
+### io_uring Event Loop
 - Full io_uring async engine replacing epoll for zero-copy, batched syscalls
 - Multishot accept, provided buffer pools, zero-copy send
 - Async splice for file-to-socket transfers
 
-### Universal Stream Interface (New)
+### Universal Stream Interface
 - IStream abstraction decoupling request logic from transport
 - TCP, TLS, HTTP/2, and QUIC streams share one interface
 
-### Arena & Slab Allocators (New)
+### Arena & Slab Allocators
 - Per-request arena allocator with O(1) reset (no malloc/free contention)
 - Slab allocator for fixed-size object pools (connection contexts)
 
@@ -60,43 +60,43 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 - Certificate/key verification at startup
 - **mTLS support** (New) - mutual TLS for service mesh communication
 
-### Automatic Let's Encrypt (ACME) (New)
+### Automatic Let's Encrypt
 - Built-in ACME client for automatic certificate management
 - HTTP-01 challenge handling at `/.well-known/acme-challenge/*`
 - Certificate auto-renewal before expiry
 
-### Brotli & Zstd Compression (New)
+### Brotli & Zstd Compression
 - On-the-fly and streaming compression
 - Accept-Encoding negotiation (prefers zstd > br > gzip)
 - MIME-type aware (only compresses text-based content)
 
-### Web Application Firewall (WAF)
+### Web Application Firewall
 - **User-Agent blocking**: sqlmap, nikto, nmap, masscan, dirbuster, gobuster, wfuzz, hydra, metasploit, burpsuite, acunetix, and more
 - **URI pattern blocking**: path traversal (`../`), SQL injection (`UNION SELECT`, `OR 1=1`), XSS (`<script>`, `javascript:`), RCE (`system()`, `exec()`)
 - **Header injection detection**: CRLF injection, null byte injection, oversized headers
 - **Body inspection**: XSS and code injection patterns in POST data
 - **Recursive normalization**: double/triple URL encoding, HTML entities, null byte stripping
 
-### JWT Edge Validation (New)
+### JWT Edge Validation
 - Validates JWT tokens at the edge (HS256, RS256, ES256)
 - Rejects expired/invalid tokens before they reach backends
 - Configurable issuer and audience requirements
 
-### Reverse Proxy & Load Balancer (New)
+### Reverse Proxy & Load Balancer
 - Multi-backend HTTP proxy with retry, timeout, health checks
 - **Round-Robin**, **Least-Connections**, **EWMA** (fastest-right-now), **Consistent Hashing** (session affinity)
 - Hop-by-hop header stripping, X-Forwarded-For injection
 
-### LRU Microcache (New)
+### LRU Microcache
 - In-memory response cache with `stale-while-revalidate`
 - Cache-Control header parsing (max-age, s-maxage, no-store)
 - Configurable max entries and memory limits
 
-### OpenTelemetry Tracing (New)
+### OpenTelemetry Tracing
 - W3C `traceparent` header generation and propagation
 - Compatible with Jaeger, Zipkin, and any W3C-compliant system
 
-### Anti-Bot System (New)
+### Anti-Bot System
 - **JA3/JA4 TLS fingerprinting** - passive detection of bots masquerading as browsers
 - **Token Bucket rate limiter** - adaptive per-IP/session/fingerprint
 - **JS Challenge** - browser verification page blocking scrapers
@@ -104,7 +104,7 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 - **Tarpit** - 1 byte/sec response drip to exhaust scanner connection pools
 - **GeoIP filtering interface** - country/Tor/VPN blocking (MaxMind compatible)
 
-### WASM Plugin System (New)
+### WASM Plugin System
 - Sandboxed plugin execution for routing, auth, logging
 - Plugin hooks: ON_REQUEST, ON_RESPONSE, ON_ROUTE, ON_AUTH, ON_LOG
 - Write plugins in Rust, Go, AssemblyScript, or C
@@ -263,6 +263,4 @@ See `config/justserver.conf` for all configuration options.
 
 Copyright (c) 2026 Ruslan Semchenko. All rights reserved.
 
-This project is currently in an active development and testing phase. The source code is provided for educational and review purposes only. Use, modification, or distribution of this software, in whole or in part, is strictly prohibited without explicit written permission from the author.
-
-As the project is undergoing significant architectural changes and feature enhancements, it is not yet intended for production use.
+Project in active development so dont use this please DONT USE.

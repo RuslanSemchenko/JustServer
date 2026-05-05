@@ -35,9 +35,22 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 - Single reactor thread distributing to worker thread pool
 - Non-blocking accepts with `accept4()` and `SOCK_CLOEXEC`
 
+### io_uring Event Loop (New)
+- Full io_uring async engine replacing epoll for zero-copy, batched syscalls
+- Multishot accept, provided buffer pools, zero-copy send
+- Async splice for file-to-socket transfers
+
+### Universal Stream Interface (New)
+- IStream abstraction decoupling request logic from transport
+- TCP, TLS, HTTP/2, and QUIC streams share one interface
+
+### Arena & Slab Allocators (New)
+- Per-request arena allocator with O(1) reset (no malloc/free contention)
+- Slab allocator for fixed-size object pools (connection contexts)
+
 ### DDoS Protection
 - Per-IP connection limit (configurable, default 50)
-- Header read timeout (default 3s) - drops slow clients
+- Header read timeout (default 5s) - drops slow clients
 - Maximum request size enforcement (default 8MB)
 - Automatic stale connection cleanup
 
@@ -45,12 +58,56 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 - TLS 1.3 only - no legacy protocol fallback
 - Strong ciphersuites: AES-256-GCM, ChaCha20-Poly1305, AES-128-GCM
 - Certificate/key verification at startup
+- **mTLS support** (New) - mutual TLS for service mesh communication
+
+### Automatic Let's Encrypt (ACME) (New)
+- Built-in ACME client for automatic certificate management
+- HTTP-01 challenge handling at `/.well-known/acme-challenge/*`
+- Certificate auto-renewal before expiry
+
+### Brotli & Zstd Compression (New)
+- On-the-fly and streaming compression
+- Accept-Encoding negotiation (prefers zstd > br > gzip)
+- MIME-type aware (only compresses text-based content)
 
 ### Web Application Firewall (WAF)
 - **User-Agent blocking**: sqlmap, nikto, nmap, masscan, dirbuster, gobuster, wfuzz, hydra, metasploit, burpsuite, acunetix, and more
 - **URI pattern blocking**: path traversal (`../`), SQL injection (`UNION SELECT`, `OR 1=1`), XSS (`<script>`, `javascript:`), RCE (`system()`, `exec()`)
 - **Header injection detection**: CRLF injection, null byte injection, oversized headers
 - **Body inspection**: XSS and code injection patterns in POST data
+- **Recursive normalization**: double/triple URL encoding, HTML entities, null byte stripping
+
+### JWT Edge Validation (New)
+- Validates JWT tokens at the edge (HS256, RS256, ES256)
+- Rejects expired/invalid tokens before they reach backends
+- Configurable issuer and audience requirements
+
+### Reverse Proxy & Load Balancer (New)
+- Multi-backend HTTP proxy with retry, timeout, health checks
+- **Round-Robin**, **Least-Connections**, **EWMA** (fastest-right-now), **Consistent Hashing** (session affinity)
+- Hop-by-hop header stripping, X-Forwarded-For injection
+
+### LRU Microcache (New)
+- In-memory response cache with `stale-while-revalidate`
+- Cache-Control header parsing (max-age, s-maxage, no-store)
+- Configurable max entries and memory limits
+
+### OpenTelemetry Tracing (New)
+- W3C `traceparent` header generation and propagation
+- Compatible with Jaeger, Zipkin, and any W3C-compliant system
+
+### Anti-Bot System (New)
+- **JA3/JA4 TLS fingerprinting** - passive detection of bots masquerading as browsers
+- **Token Bucket rate limiter** - adaptive per-IP/session/fingerprint
+- **JS Challenge** - browser verification page blocking scrapers
+- **Proof-of-Work** - compute challenge for L7 DDoS mitigation
+- **Tarpit** - 1 byte/sec response drip to exhaust scanner connection pools
+- **GeoIP filtering interface** - country/Tor/VPN blocking (MaxMind compatible)
+
+### WASM Plugin System (New)
+- Sandboxed plugin execution for routing, auth, logging
+- Plugin hooks: ON_REQUEST, ON_RESPONSE, ON_ROUTE, ON_AUTH, ON_LOG
+- Write plugins in Rust, Go, AssemblyScript, or C
 
 ### Path Traversal Protection
 - URI percent-decoding before validation
@@ -70,17 +127,22 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 ## Building
 
 ### Requirements
-- Linux (epoll-based)
-- C++20 compiler (clang++ recommended)
+- Linux (kernel 5.10+ for io_uring)
+- Clang 22+ (zero warnings policy: `-Wall -Wextra -Wpedantic -Werror`)
 - CMake 3.20+
-- OpenSSL development libraries
-- Optional: mold or lld linker
+- OpenSSL 3.x, RE2, liburing, Brotli, Zstd
 
 ### Build Steps
 
 ```bash
 # Install dependencies (Debian/Ubuntu)
-sudo apt install cmake clang libssl-dev
+sudo apt install cmake libssl-dev libre2-dev liburing-dev \
+  libbrotli-dev libzstd-dev pkg-config
+
+# Install Clang 22
+wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
+tar xf LLVM-22.1.4-Linux-X64.tar.xz
+export PATH="$PWD/LLVM-22.1.4-Linux-X64/bin:$PATH"
 
 # Build
 mkdir build && cd build
@@ -198,6 +260,7 @@ See `config/justserver.conf` for all configuration options.
 - **`chroot()` support** - filesystem isolation when running as root
 
 ## License
+
 Copyright (c) 2026 Ruslan Semchenko. All rights reserved.
 
 This project is currently in an active development and testing phase. The source code is provided for educational and review purposes only. Use, modification, or distribution of this software, in whole or in part, is strictly prohibited without explicit written permission from the author.

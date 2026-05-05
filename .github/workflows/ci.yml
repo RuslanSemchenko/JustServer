@@ -20,18 +20,35 @@ jobs:
             sanitize: OFF
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config
+          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config \
+            liburing-dev libbrotli-dev libzstd-dev
 
       - name: Install Clang 22
         run: |
           wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
           tar xf LLVM-22.1.4-Linux-X64.tar.xz
           echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+
+      - name: Build ngtcp2 & nghttp3
+        run: |
+          git clone --depth 1 https://github.com/ngtcp2/nghttp3.git /tmp/nghttp3
+          cd /tmp/nghttp3 && git submodule update --init
+          cmake -S /tmp/nghttp3 -B /tmp/nghttp3/build -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF
+          cmake --build /tmp/nghttp3/build -j$(nproc)
+          sudo cmake --install /tmp/nghttp3/build
+          git clone --depth 1 https://github.com/ngtcp2/ngtcp2.git /tmp/ngtcp2
+          cd /tmp/ngtcp2 && git submodule update --init
+          cmake -S /tmp/ngtcp2 -B /tmp/ngtcp2/build -DENABLE_OPENSSL=OFF -DENABLE_GNUTLS=OFF \
+            -DENABLE_WOLFSSL=OFF -DENABLE_BORINGSSL=OFF -DENABLE_PICOTLS=OFF \
+            -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF
+          cmake --build /tmp/ngtcp2/build -j$(nproc)
+          sudo cmake --install /tmp/ngtcp2/build
+          sudo ldconfig
 
       - name: Configure
         run: |
@@ -58,18 +75,35 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config
+          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config \
+            liburing-dev libbrotli-dev libzstd-dev
 
       - name: Install Clang 22
         run: |
           wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
           tar xf LLVM-22.1.4-Linux-X64.tar.xz
           echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+
+      - name: Build ngtcp2 & nghttp3
+        run: |
+          git clone --depth 1 https://github.com/ngtcp2/nghttp3.git /tmp/nghttp3
+          cd /tmp/nghttp3 && git submodule update --init
+          cmake -S /tmp/nghttp3 -B /tmp/nghttp3/build -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF
+          cmake --build /tmp/nghttp3/build -j$(nproc)
+          sudo cmake --install /tmp/nghttp3/build
+          git clone --depth 1 https://github.com/ngtcp2/ngtcp2.git /tmp/ngtcp2
+          cd /tmp/ngtcp2 && git submodule update --init
+          cmake -S /tmp/ngtcp2 -B /tmp/ngtcp2/build -DENABLE_OPENSSL=OFF -DENABLE_GNUTLS=OFF \
+            -DENABLE_WOLFSSL=OFF -DENABLE_BORINGSSL=OFF -DENABLE_PICOTLS=OFF \
+            -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF
+          cmake --build /tmp/ngtcp2/build -j$(nproc)
+          sudo cmake --install /tmp/ngtcp2/build
+          sudo ldconfig
 
       - name: Configure with sanitizers
         run: |
@@ -96,18 +130,35 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config
+          sudo apt-get install -y cmake libssl-dev libre2-dev pkg-config \
+            liburing-dev libbrotli-dev libzstd-dev
 
       - name: Install Clang 22
         run: |
           wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
           tar xf LLVM-22.1.4-Linux-X64.tar.xz
           echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+
+      - name: Build ngtcp2 & nghttp3
+        run: |
+          git clone --depth 1 https://github.com/ngtcp2/nghttp3.git /tmp/nghttp3
+          cd /tmp/nghttp3 && git submodule update --init
+          cmake -S /tmp/nghttp3 -B /tmp/nghttp3/build -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF
+          cmake --build /tmp/nghttp3/build -j$(nproc)
+          sudo cmake --install /tmp/nghttp3/build
+          git clone --depth 1 https://github.com/ngtcp2/ngtcp2.git /tmp/ngtcp2
+          cd /tmp/ngtcp2 && git submodule update --init
+          cmake -S /tmp/ngtcp2 -B /tmp/ngtcp2/build -DENABLE_OPENSSL=OFF -DENABLE_GNUTLS=OFF \
+            -DENABLE_WOLFSSL=OFF -DENABLE_BORINGSSL=OFF -DENABLE_PICOTLS=OFF \
+            -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF
+          cmake --build /tmp/ngtcp2/build -j$(nproc)
+          sudo cmake --install /tmp/ngtcp2/build
+          sudo ldconfig
 
       - name: Configure fuzz build
         run: |

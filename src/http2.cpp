@@ -286,7 +286,7 @@ struct HuffmanTrieNode {
     uint16_t children[2]; // indices into the node vector (0 = none)
 };
 
-static const std::vector<HuffmanTrieNode>& get_huffman_trie() {
+[[maybe_unused]] static const std::vector<HuffmanTrieNode>& get_huffman_trie() {
     static const auto trie = []() {
         std::vector<HuffmanTrieNode> nodes;
         nodes.reserve(1024);
@@ -310,8 +310,6 @@ static const std::vector<HuffmanTrieNode>& get_huffman_trie() {
     return trie;
 }
 
-static std::optional<std::string> huffman_decode(std::span<const uint8_t> data, size_t encoded_len) {
-    const auto& trie = get_huffman_trie();
 // ===== Fast Huffman Decoder using prefix lookup table =====
 //
 // Instead of scanning all 256 symbols per decoded character (O(n*256)),
@@ -353,25 +351,27 @@ struct HuffmanLookup {
         for (int sym = 0; sym < 256; ++sym) {
             const auto& h = HUFFMAN_TABLE[static_cast<size_t>(sym)];
             if (h.bits <= HUFF_LOOKUP_BITS) {
-                // Fill all table entries whose prefix matches this code.
-                // A code of length L occupies 2^(HUFF_LOOKUP_BITS - L) slots.
                 int shift = HUFF_LOOKUP_BITS - h.bits;
                 int base = static_cast<int>(h.code) << shift;
                 int count = 1 << shift;
                 for (int j = 0; j < count; ++j) {
-                    fast_table[base + j] = {
-                        static_cast<int16_t>(sym),
-                        h.bits
-                    };
+                    int idx = base + j;
+                    if (idx >= 0 && idx < HUFF_LOOKUP_SIZE) {
+                        fast_table[idx] = {
+                            static_cast<int16_t>(sym),
+                            h.bits
+                        };
+                    }
                 }
             } else {
-                long_codes[long_code_count++] = {
-                    h.code, h.bits, static_cast<uint8_t>(sym)
-                };
+                if (long_code_count < 160) {
+                    long_codes[long_code_count++] = {
+                        h.code, h.bits, static_cast<uint8_t>(sym)
+                    };
+                }
             }
         }
 
-        // Sort long codes by bit length (ascending) for early-exit during scan
         std::sort(long_codes, long_codes + long_code_count,
             [](const HuffLongCode& a, const HuffLongCode& b) {
                 return a.bits < b.bits || (a.bits == b.bits && a.code < b.code);
@@ -387,30 +387,8 @@ static const HuffmanLookup& get_huffman_lookup() {
 static std::optional<std::string> huffman_decode(std::span<const uint8_t> data, size_t encoded_len) {
     const auto& lookup = get_huffman_lookup();
     std::string result;
-    result.reserve(encoded_len * 2); // Huffman-encoded strings usually expand
+    result.reserve(encoded_len * 2);
 
-    uint16_t node = 0; // current trie node (0 = root)
-    uint8_t bits_without_emit = 0; // track padding bits at end
-
-    for (size_t i = 0; i < encoded_len; ++i) {
-        uint8_t byte = data[i];
-        for (int bit = 7; bit >= 0; --bit) {
-            int b = (byte >> bit) & 1;
-            node = trie[node].children[b];
-            if (node == 0) {
-                return std::nullopt; // invalid code path
-            }
-            if (trie[node].symbol >= 0) {
-                if (trie[node].symbol == 256) {
-                    return std::nullopt; // EOS symbol decoded -- RFC 7541 says this is an error
-                }
-                result += static_cast<char>(trie[node].symbol);
-                node = 0; // back to root
-                bits_without_emit = 0;
-            } else {
-                ++bits_without_emit;
-                if (bits_without_emit > 30) {
-                    return std::nullopt; // no valid code is longer than 30 bits
     uint64_t acc = 0;
     uint8_t bits = 0;
 
@@ -419,9 +397,6 @@ static std::optional<std::string> huffman_decode(std::span<const uint8_t> data, 
         bits += 8;
 
         while (bits >= 5) { // Minimum Huffman code is 5 bits
-            // Fast path: use the 10-bit prefix lookup table.
-            // If we have >= 10 bits, index directly.
-            // If we have < 10 bits, left-align into a 10-bit index.
             uint32_t index;
             if (bits >= HUFF_LOOKUP_BITS) {
                 index = static_cast<uint32_t>(
@@ -439,12 +414,11 @@ static std::optional<std::string> huffman_decode(std::span<const uint8_t> data, 
                 continue;
             }
 
-            // Slow path: scan long codes (> 10 bits). Only reached for
-            // non-ASCII / rare characters whose Huffman codes exceed 10 bits.
+            // Slow path: scan long codes (> 10 bits)
             bool found = false;
             for (size_t lc = 0; lc < lookup.long_code_count; ++lc) {
                 const auto& lce = lookup.long_codes[lc];
-                if (lce.bits > bits) break; // Sorted by bits; no point checking longer codes
+                if (lce.bits > bits) break;
                 uint32_t candidate = static_cast<uint32_t>(
                     (acc >> (bits - lce.bits)) & ((1ULL << lce.bits) - 1));
                 if (candidate == lce.code) {
@@ -457,7 +431,6 @@ static std::optional<std::string> huffman_decode(std::span<const uint8_t> data, 
             }
 
             if (!found) {
-                // Check if remaining bits are valid EOS padding (all 1s)
                 if (bits <= 7) {
                     uint32_t padding = static_cast<uint32_t>(acc & ((1ULL << bits) - 1));
                     uint32_t expected = static_cast<uint32_t>((1ULL << bits) - 1);
@@ -465,24 +438,11 @@ static std::optional<std::string> huffman_decode(std::span<const uint8_t> data, 
                         return result; // Valid EOS padding
                     }
                 }
+                return std::nullopt; // Invalid code
             }
         }
     }
 
-    // Remaining bits must be valid EOS padding (all 1s, at most 7 bits).
-    // After the last emitted symbol we should be on a path towards EOS
-    // and every bit we consumed since should have been 1.
-    if (node != 0) {
-        if (bits_without_emit > 7) return std::nullopt;
-        // Verify padding bits were all 1s by checking we're on the
-        // all-ones path from root.  Re-walk the last bits_without_emit
-        // ones from root -- they must land us at the same node.
-        uint16_t check = 0;
-        for (uint8_t j = 0; j < bits_without_emit; ++j) {
-            check = trie[check].children[1]; // bit = 1
-            if (check == 0) return std::nullopt;
-        }
-        if (check != node) return std::nullopt; // padding wasn't all 1s
     // Check remaining bits are valid EOS padding (all 1s, at most 7 bits)
     if (bits > 0) {
         if (bits > 7) return std::nullopt;

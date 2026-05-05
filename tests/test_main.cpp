@@ -36,6 +36,15 @@ bool register_test(const char* name, std::function<bool()> func) {
 // Include test files (they use the macros above)
 // These are compiled as separate translation units, so we just run them here.
 
+// Forward declarations of new test suites
+extern void run_arena_tests();
+extern void run_compression_tests();
+extern void run_cache_tests();
+extern void run_load_balancer_tests();
+extern void run_jwt_tests();
+extern void run_anti_bot_tests();
+extern void run_tracing_tests();
+
 int main() {
     int passed = 0;
     int failed = 0;
@@ -59,6 +68,16 @@ int main() {
 
     std::cout << "\n" << passed << " passed, " << failed << " failed, "
               << (passed + failed) << " total\n";
+
+    // Run new test suites (standalone test functions)
+    std::cout << "\n=== Running Extended Test Suites ===\n\n";
+    try { run_arena_tests(); } catch (const std::exception& e) { std::cerr << "Arena tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_compression_tests(); } catch (const std::exception& e) { std::cerr << "Compression tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_cache_tests(); } catch (const std::exception& e) { std::cerr << "Cache tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_load_balancer_tests(); } catch (const std::exception& e) { std::cerr << "Load balancer tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_jwt_tests(); } catch (const std::exception& e) { std::cerr << "JWT tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_anti_bot_tests(); } catch (const std::exception& e) { std::cerr << "Anti-bot tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_tracing_tests(); } catch (const std::exception& e) { std::cerr << "Tracing tests EXCEPTION: " << e.what() << "\n"; failed++; }
 
     return failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -59,6 +59,11 @@ public:
     // Extract the Authorization: Bearer <token> from a request header
     static std::optional<std::string_view> extract_bearer_token(std::string_view auth_header);
 
+    // State-machine JSON parser (handles escapes, nesting, key vs value)
+    // Public so fuzzers and tests can exercise them directly.
+    static std::optional<std::string> json_get_string(std::string_view json, std::string_view key);
+    static std::optional<int64_t> json_get_number(std::string_view json, std::string_view key);
+
 private:
     // JWT parts
     struct JwtParts {
@@ -73,9 +78,14 @@ private:
     // Base64url decode
     static std::optional<std::string> base64url_decode(std::string_view input);
 
-    // Minimal JSON parser (extracts string/number values by key)
-    static std::optional<std::string> json_get_string(std::string_view json, std::string_view key);
-    static std::optional<int64_t> json_get_number(std::string_view json, std::string_view key);
+    // Internal: parse a JSON string token starting at pos (pos points to opening '"')
+    // Returns the unescaped string content and advances pos past the closing '"'.
+    // Returns std::nullopt on malformed input.
+    static std::optional<std::string> parse_json_string(std::string_view json, size_t& pos);
+
+    // Internal: skip a JSON value (string, number, object, array, bool, null)
+    // starting at pos.  Returns false on malformed input.
+    static bool skip_json_value(std::string_view json, size_t& pos);
 
     // Verify HMAC-SHA256 signature
     bool verify_hs256(std::string_view signing_input, std::string_view signature) const;

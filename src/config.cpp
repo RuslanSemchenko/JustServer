@@ -57,6 +57,20 @@ Config Config::load_from_file(const std::string& path) {
         else if (key == "waf_enabled") config.waf_enabled = (value == "true" || value == "1");
         else if (key == "waf_body_inspection_limit") config.waf_body_inspection_limit = static_cast<size_t>(std::stoi(value));
         else if (key == "log_level") config.log_level = value;
+        // Rate limiting
+        else if (key == "rate_limit_rps") config.rate_limit_rps = std::stod(value);
+        else if (key == "rate_limit_burst") config.rate_limit_burst = std::stod(value);
+        // Global limits
+        else if (key == "max_total_connections") config.max_total_connections = std::stoi(value);
+        else if (key == "max_memory_bytes") config.max_memory_bytes = static_cast<size_t>(std::stoll(value));
+        else if (key == "max_open_files") config.max_open_files = std::stoi(value);
+        // Privilege dropping
+        else if (key == "drop_uid") config.drop_uid = std::stoi(value);
+        else if (key == "drop_gid") config.drop_gid = std::stoi(value);
+        // Metrics access
+        else if (key == "metrics_localhost_only") config.metrics_localhost_only = (value == "true" || value == "1");
+        // Server header
+        else if (key == "server_header") config.server_header = value;
         // Security headers
         else if (key == "security_headers_enabled") config.security_headers.enabled = (value == "true" || value == "1");
         else if (key == "csp_enabled") config.security_headers.csp_enabled = (value == "true" || value == "1");

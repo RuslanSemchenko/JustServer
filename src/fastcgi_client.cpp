@@ -191,10 +191,27 @@ std::optional<std::string> FastCGIClient::read_response(int fd) {
         uint16_t content_length = ntohs(hdr.content_length);
         uint8_t padding_length = hdr.padding_length;
 
-        std::string content(content_length, '\0');
+        // Validate content_length to prevent integer overflow / excessive allocation
+        // FastCGI spec allows up to 65535 bytes per record, but we cap at a sane limit
+        static constexpr size_t MAX_FCGI_CONTENT = 65535;
+        if (static_cast<size_t>(content_length) > MAX_FCGI_CONTENT) {
+            LOG_ERROR("FastCGI: content_length exceeds maximum (" +
+                      std::to_string(content_length) + ")");
+            return std::nullopt;
+        }
+
+        // Guard total accumulated data against unbounded growth
+        static constexpr size_t MAX_FCGI_RESPONSE = 64 * 1024 * 1024; // 64 MB
+        if (stdout_data.size() + static_cast<size_t>(content_length) > MAX_FCGI_RESPONSE) {
+            LOG_ERROR("FastCGI: response exceeds maximum size");
+            return std::nullopt;
+        }
+
+        std::string content(static_cast<size_t>(content_length), '\0');
         size_t total_read = 0;
-        while (total_read < content_length) {
-            n = read(fd, content.data() + total_read, content_length - total_read);
+        while (total_read < static_cast<size_t>(content_length)) {
+            n = read(fd, content.data() + total_read,
+                     static_cast<size_t>(content_length) - total_read);
             if (n <= 0) {
                 LOG_ERROR("FastCGI: read content failed");
                 return std::nullopt;
@@ -202,12 +219,14 @@ std::optional<std::string> FastCGIClient::read_response(int fd) {
             total_read += static_cast<size_t>(n);
         }
 
-        // Skip padding
+        // Skip padding (padding_length is uint8_t, max 255 -- no overflow possible)
         if (padding_length > 0) {
             char pad[256];
             size_t pad_read = 0;
-            while (pad_read < padding_length) {
-                n = read(fd, pad, std::min(static_cast<size_t>(padding_length) - pad_read, sizeof(pad)));
+            while (pad_read < static_cast<size_t>(padding_length)) {
+                size_t to_read = std::min(
+                    static_cast<size_t>(padding_length) - pad_read, sizeof(pad));
+                n = read(fd, pad, to_read);
                 if (n <= 0) break;
                 pad_read += static_cast<size_t>(n);
             }

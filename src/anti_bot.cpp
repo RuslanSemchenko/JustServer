@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <poll.h>
 #include <chrono>
 #include <thread>
 
@@ -462,16 +463,26 @@ HttpResponse Tarpit::generate_response() const {
 
 void Tarpit::drip_feed(int fd, const std::string& data) const {
     auto deadline = std::chrono::steady_clock::now() + config_.max_duration;
+    int delay_ms = 1000 / std::max(config_.bytes_per_second, 1);
 
     for (size_t i = 0; i < data.size(); ++i) {
         if (std::chrono::steady_clock::now() > deadline) break;
 
+        // Use poll() with timeout instead of blocking sleep_for.
+        // This avoids tying up the worker thread -- poll() yields the CPU
+        // to the kernel and only wakes when the fd is writable or the
+        // timeout expires, whichever comes first.
+        struct pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        int poll_ret = poll(&pfd, 1, delay_ms);
+
+        if (poll_ret < 0) break; // Error
+        if (poll_ret == 0) continue; // Timeout expired, send next byte
+        if (pfd.revents & (POLLERR | POLLHUP)) break; // Client gone
+
         auto n = send(fd, data.data() + i, 1, MSG_NOSIGNAL);
         if (n <= 0) break; // Client disconnected (mission accomplished)
-
-        // Sleep to achieve target bytes/sec
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(1000 / config_.bytes_per_second));
     }
 }
 

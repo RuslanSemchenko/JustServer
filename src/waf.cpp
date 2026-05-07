@@ -406,9 +406,9 @@ int WAF::check_xss(std::string_view data, Verdict& v) const {
         v.tags.push_back("xss-script-uri");
     }
 
-    // Dangerous HTML tags
+    // Dangerous HTML tags (script, svg, iframe, etc.)
     if (re_xss_tags_ && re2::RE2::PartialMatch(sp, *re_xss_tags_)) {
-        score += 3;
+        score += 5;
         if (v.reason.empty()) v.reason = "XSS: Dangerous HTML tag detected";
         v.tags.push_back("xss-dangerous-tag");
     }
@@ -458,7 +458,7 @@ int WAF::check_rce(std::string_view data, Verdict& v) const {
     }
 
     if (re_rce_commands_ && re2::RE2::PartialMatch(sp, *re_rce_commands_)) {
-        score += 4;
+        score += 5;
         if (v.reason.empty()) v.reason = "RCE: OS command/file access detected";
         v.tags.push_back("rce-command");
     }

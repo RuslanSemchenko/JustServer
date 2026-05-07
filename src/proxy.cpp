@@ -223,12 +223,17 @@ std::optional<HttpResponse> ReverseProxy::do_http_request(const HttpRequest& req
         sent += static_cast<size_t>(n);
     }
 
-    // Read response
+    // Read response (cap at 64 MB to prevent unbounded memory growth)
+    static constexpr size_t MAX_PROXY_RESPONSE = 64 * 1024 * 1024;
     std::string response_data;
     char buf[8192];
     while (true) {
         auto n = recv(sockfd, buf, sizeof(buf), 0);
         if (n <= 0) break;
+        if (response_data.size() + static_cast<size_t>(n) > MAX_PROXY_RESPONSE) {
+            LOG_WARN("Proxy: response exceeds maximum size, truncating");
+            break;
+        }
         response_data.append(buf, static_cast<size_t>(n));
     }
     close(sockfd);
@@ -247,9 +252,22 @@ std::optional<HttpResponse> ReverseProxy::do_http_request(const HttpRequest& req
     if (sp1 == std::string_view::npos) return std::nullopt;
     auto sp2 = status_line.find(' ', sp1 + 1);
     auto code_str = status_line.substr(sp1 + 1, sp2 - sp1 - 1);
+
+    // Parse status code with overflow protection (valid range: 100-999)
     resp.status_code = 0;
     for (char c : code_str) {
-        if (c >= '0' && c <= '9') resp.status_code = resp.status_code * 10 + (c - '0');
+        if (c >= '0' && c <= '9') {
+            int digit = c - '0';
+            if (resp.status_code > 99) {
+                // Already 3 digits -- stop parsing to prevent overflow
+                break;
+            }
+            resp.status_code = resp.status_code * 10 + digit;
+        }
+    }
+    // Validate status code range
+    if (resp.status_code < 100 || resp.status_code > 999) {
+        return std::nullopt;
     }
     if (sp2 != std::string_view::npos) {
         resp.status_text = std::string(status_line.substr(sp2 + 1));

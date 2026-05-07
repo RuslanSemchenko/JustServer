@@ -42,6 +42,14 @@ void Worker::apply_security_headers(HttpResponse& resp) const {
     if (sh.referrer_policy_enabled) {
         resp.headers["Referrer-Policy"] = sh.referrer_policy_value;
     }
+
+    // Server header: configurable or omitted entirely to prevent fingerprinting
+    if (!config_.server_header.empty()) {
+        resp.headers["Server"] = config_.server_header;
+    } else {
+        // Remove any Server header that may have been set by sub-handlers
+        resp.headers.erase("Server");
+    }
 }
 
 void Worker::handle_h2_connection(SSL* ssl, int client_fd, const std::string& client_ip) {
@@ -50,7 +58,7 @@ void Worker::handle_h2_connection(SSL* ssl, int client_fd, const std::string& cl
     // gRPC handler for this connection
     GrpcHandler grpc;
 
-    Http2Connection h2_conn([this, &grpc](const HttpRequest& req) -> HttpResponse {
+    Http2Connection h2_conn([this, &grpc, &client_ip](const HttpRequest& req) -> HttpResponse {
         // WAF inspection for HTTP/2 requests
         if (config_.waf_enabled && waf_) {
             auto verdict = waf_->inspect(req, config_.waf_body_inspection_limit);
@@ -60,6 +68,11 @@ void Worker::handle_h2_connection(SSL* ssl, int client_fd, const std::string& cl
             }
         }
 
+        // Rate limit check for HTTP/2 requests
+        if (ddos_ && !ddos_->allow_request(client_ip)) {
+            return HttpResponse::make_error(429, "Too Many Requests");
+        }
+
         // Route gRPC requests through the gRPC handler
         if (GrpcHandler::is_grpc_request(req)) {
             auto resp = grpc.handle(req);
@@ -67,7 +80,7 @@ void Worker::handle_h2_connection(SSL* ssl, int client_fd, const std::string& cl
             return resp;
         }
 
-        auto resp = route_request(req);
+        auto resp = route_request(req, client_ip);
         apply_security_headers(resp);
         return resp;
     });
@@ -216,6 +229,30 @@ void Worker::handle_connection(int client_fd, const std::string& client_ip) {
         }
     }
 
+    // Rate limit check -- must happen before any early-return path
+    // (sendfile, WebSocket upgrade, etc.) so every request consumes a token.
+    if (ddos_ && !ddos_->allow_request(client_ip)) {
+        auto resp = HttpResponse::make_error(429, "Too Many Requests");
+        apply_security_headers(resp);
+        if (ssl) {
+            send_response(ssl, client_fd, resp);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+        } else {
+            send_response_plain(client_fd, resp);
+        }
+
+        auto elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start_time).count();
+        Metrics::instance().record_request(429, elapsed);
+
+        close(client_fd);
+        ddos_->release_connection(client_ip);
+        Metrics::instance().record_disconnection();
+        Metrics::instance().record_worker_idle();
+        return;
+    }
+
     // Check for WebSocket upgrade request
     if (WsHandshake::is_upgrade_request(req)) {
         handle_websocket(ssl, client_fd, client_ip, req);
@@ -238,7 +275,7 @@ void Worker::handle_connection(int client_fd, const std::string& client_ip) {
     }
 
     // Route and handle request
-    auto resp = route_request(req);
+    auto resp = route_request(req, client_ip);
     apply_security_headers(resp);
 
     auto elapsed = std::chrono::duration<double, std::milli>(
@@ -415,9 +452,13 @@ void Worker::send_response_plain(int fd, const HttpResponse& resp) {
     }
 }
 
-HttpResponse Worker::route_request(const HttpRequest& req) {
-    // Prometheus metrics endpoint
+HttpResponse Worker::route_request(const HttpRequest& req, const std::string& client_ip) {
+    // Prometheus metrics endpoint -- restricted to localhost if configured
     if (req.path == "/metrics") {
+        if (config_.metrics_localhost_only &&
+            client_ip != "127.0.0.1" && client_ip != "::1" && !client_ip.empty()) {
+            return HttpResponse::make_error(403, "Metrics access denied");
+        }
         return Metrics::instance().serve_metrics();
     }
 

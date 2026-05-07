@@ -8,11 +8,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Enforce Clang 18+ compiler (Zero Policy Warning: -Werror)
 if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    message(FATAL_ERROR "JustServer requires Clang 18+. Current compiler: ${CMAKE_CXX_COMPILER_ID}. "
+    message(FATAL_ERROR "JustServer requires Clang 22+. Current compiler: ${CMAKE_CXX_COMPILER_ID}. "
                         "Use: cmake -DCMAKE_CXX_COMPILER=clang++ ..")
 endif()
 if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
-    message(FATAL_ERROR "JustServer requires Clang 18+. Found: ${CMAKE_CXX_COMPILER_VERSION}. "
+    message(FATAL_ERROR "JustServer requires Clang 22+. Found: ${CMAKE_CXX_COMPILER_VERSION}. "
                         "Get LLVM from https://github.com/llvm/llvm-project/releases")
 endif()
 
@@ -280,6 +280,44 @@ if(BUILD_FUZZ)
     )
     target_include_directories(fuzz_waf PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR} ${RE2_INCLUDE_DIRS})
     target_link_libraries(fuzz_waf PRIVATE ${RE2_LIBRARIES} pthread)
+
+    # JWT validator fuzzer -- tests the state-machine JSON parser
+    add_executable(fuzz_jwt
+        fuzz/fuzz_jwt.cpp
+        src/jwt_validator.cpp
+        src/logger.cpp
+    )
+    target_include_directories(fuzz_jwt PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR})
+    target_link_libraries(fuzz_jwt PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread)
+
+    # FastCGI protocol fuzzer -- tests response parsing robustness
+    add_executable(fuzz_fastcgi
+        fuzz/fuzz_fastcgi.cpp
+        src/fastcgi_client.cpp
+        src/http_parser.cpp
+        src/logger.cpp
+    )
+    target_include_directories(fuzz_fastcgi PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR} ${RE2_INCLUDE_DIRS})
+    target_link_libraries(fuzz_fastcgi PRIVATE ${RE2_LIBRARIES} pthread)
+
+    # HTTP/3 QUIC fuzzer -- tests QUIC frame/stream parsing
+    add_executable(fuzz_http3
+        fuzz/fuzz_http3.cpp
+        src/http3.cpp
+        src/http_parser.cpp
+        src/stream.cpp
+        src/logger.cpp
+        src/metrics.cpp
+    )
+    target_include_directories(fuzz_http3 PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR} ${RE2_INCLUDE_DIRS}
+        ${NGTCP2_INCLUDE_DIRS} ${NGHTTP3_INCLUDE_DIRS}
+    )
+    target_link_libraries(fuzz_http3 PRIVATE
+        OpenSSL::SSL OpenSSL::Crypto
+        ${NGTCP2_LIBRARIES} ${NGHTTP3_LIBRARIES}
+        ${RE2_LIBRARIES} pthread
+    )
 endif()
 
 # ===== Sanitizer build =====

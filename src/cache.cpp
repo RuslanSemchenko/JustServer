@@ -139,13 +139,23 @@ void HttpCache::clear() {
 
 std::string HttpCache::build_key(const HttpRequest& req) {
     // Key: METHOD:scheme:host:path?query
+    // Includes Host, X-Forwarded-Proto, and Accept-Encoding to prevent
+    // cache poisoning attacks where different origins/schemes share entries.
     std::string key = req.method_str + ":" + req.uri;
 
-    // Include Vary headers if present
+    // Include Host to prevent cross-host cache sharing
     auto host = req.get_header("Host");
     if (!host.empty()) {
         key += "|h:" + std::string(host);
     }
+
+    // Include X-Forwarded-Proto to separate HTTP/HTTPS cached responses
+    auto proto = req.get_header("X-Forwarded-Proto");
+    if (!proto.empty()) {
+        key += "|p:" + std::string(proto);
+    }
+
+    // Include Accept-Encoding if compression is used
     auto accept_enc = req.get_header("Accept-Encoding");
     if (!accept_enc.empty()) {
         key += "|ae:" + std::string(accept_enc);

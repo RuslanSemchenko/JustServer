@@ -123,6 +123,38 @@ void test_jwt_wrong_issuer() {
     std::cout << "  [PASS] jwt_wrong_issuer\n";
 }
 
+void test_jwt_wrong_audience() {
+    std::string secret = "test-secret";
+    auto token = create_test_jwt(R"({"sub":"user","aud":"wrong-aud","exp":9999999999})", secret);
+
+    js::JwtValidator::Config config;
+    config.hmac_secret = secret;
+    config.required_audience = "expected-audience";
+    js::JwtValidator validator(config);
+
+    auto result = validator.validate(token);
+    assert(!result.valid);
+    assert(result.error.find("audience") != std::string::npos);
+
+    std::cout << "  [PASS] jwt_wrong_audience\n";
+}
+
+void test_jwt_nbf_not_yet_valid() {
+    std::string secret = "test-secret";
+    // nbf far in the future
+    auto token = create_test_jwt(R"({"sub":"user","nbf":9999999999,"exp":9999999999})", secret);
+
+    js::JwtValidator::Config config;
+    config.hmac_secret = secret;
+    js::JwtValidator validator(config);
+
+    auto result = validator.validate(token);
+    assert(!result.valid);
+    assert(result.error.find("not yet valid") != std::string::npos);
+
+    std::cout << "  [PASS] jwt_nbf_not_yet_valid\n";
+}
+
 void test_jwt_extract_bearer() {
     auto token = js::JwtValidator::extract_bearer_token("Bearer eyJ0eXAi.eyJzdWIi.signature");
     assert(token.has_value());
@@ -154,6 +186,115 @@ void test_jwt_malformed() {
     std::cout << "  [PASS] jwt_malformed\n";
 }
 
+// === New tests for hardened JSON parser ===
+
+void test_jwt_json_escaped_quotes() {
+    // Test that escaped quotes in values don't break parsing
+    // The old find()-based parser would break on escaped quotes
+    std::string secret = "test-secret";
+    std::string payload = R"({"sub":"user\"admin","exp":9999999999})";
+    auto token = create_test_jwt(payload, secret);
+
+    js::JwtValidator::Config config;
+    config.hmac_secret = secret;
+    js::JwtValidator validator(config);
+
+    auto result = validator.validate(token);
+    assert(result.valid);
+    assert(result.claims.subject == "user\"admin");
+
+    std::cout << "  [PASS] jwt_json_escaped_quotes\n";
+}
+
+void test_jwt_json_key_in_value_bypass() {
+    // Attack: embed "sub" as part of another value to confuse find()-based parser
+    // The old parser would match the "sub" inside the value of "description",
+    // returning "attacker" instead of "real-user"
+    std::string secret = "test-secret";
+    std::string payload = R"({"description":"has sub inside","sub":"real-user","exp":9999999999})";
+    auto token = create_test_jwt(payload, secret);
+
+    js::JwtValidator::Config config;
+    config.hmac_secret = secret;
+    js::JwtValidator validator(config);
+
+    auto result = validator.validate(token);
+    assert(result.valid);
+    assert(result.claims.subject == "real-user");
+
+    std::cout << "  [PASS] jwt_json_key_in_value_bypass\n";
+}
+
+void test_jwt_json_nested_objects() {
+    // Test that nested objects are skipped correctly
+    std::string secret = "test-secret";
+    std::string payload = R"({"metadata":{"sub":"nested-value","inner":true},"sub":"top-level-user","exp":9999999999})";
+    auto token = create_test_jwt(payload, secret);
+
+    js::JwtValidator::Config config;
+    config.hmac_secret = secret;
+    js::JwtValidator validator(config);
+
+    auto result = validator.validate(token);
+    assert(result.valid);
+    // The parser should find the TOP-LEVEL "sub", not the one inside "metadata"
+    assert(result.claims.subject == "top-level-user");
+
+    std::cout << "  [PASS] jwt_json_nested_objects\n";
+}
+
+void test_jwt_json_unicode_escape() {
+    // Test that \uXXXX escapes are handled
+    std::string secret = "test-secret";
+    // \u0041 = 'A'
+    std::string payload = R"({"sub":"\u0041dmin","exp":9999999999})";
+    auto token = create_test_jwt(payload, secret);
+
+    js::JwtValidator::Config config;
+    config.hmac_secret = secret;
+    js::JwtValidator validator(config);
+
+    auto result = validator.validate(token);
+    assert(result.valid);
+    assert(result.claims.subject == "Admin");
+
+    std::cout << "  [PASS] jwt_json_unicode_escape\n";
+}
+
+void test_jwt_json_arrays_in_payload() {
+    // Test that arrays are skipped correctly
+    std::string secret = "test-secret";
+    std::string payload = R"({"roles":["admin","user"],"sub":"array-test","exp":9999999999})";
+    auto token = create_test_jwt(payload, secret);
+
+    js::JwtValidator::Config config;
+    config.hmac_secret = secret;
+    js::JwtValidator validator(config);
+
+    auto result = validator.validate(token);
+    assert(result.valid);
+    assert(result.claims.subject == "array-test");
+
+    std::cout << "  [PASS] jwt_json_arrays_in_payload\n";
+}
+
+void test_jwt_json_boolean_null_values() {
+    // Test that boolean and null values are handled
+    std::string secret = "test-secret";
+    std::string payload = R"({"active":true,"deleted":false,"extra":null,"sub":"bool-test","exp":9999999999})";
+    auto token = create_test_jwt(payload, secret);
+
+    js::JwtValidator::Config config;
+    config.hmac_secret = secret;
+    js::JwtValidator validator(config);
+
+    auto result = validator.validate(token);
+    assert(result.valid);
+    assert(result.claims.subject == "bool-test");
+
+    std::cout << "  [PASS] jwt_json_boolean_null_values\n";
+}
+
 } // namespace
 
 void run_jwt_tests() {
@@ -162,7 +303,16 @@ void run_jwt_tests() {
     test_jwt_expired();
     test_jwt_invalid_signature();
     test_jwt_wrong_issuer();
+    test_jwt_wrong_audience();
+    test_jwt_nbf_not_yet_valid();
     test_jwt_extract_bearer();
     test_jwt_malformed();
+    // Hardened JSON parser tests
+    test_jwt_json_escaped_quotes();
+    test_jwt_json_key_in_value_bypass();
+    test_jwt_json_nested_objects();
+    test_jwt_json_unicode_escape();
+    test_jwt_json_arrays_in_payload();
+    test_jwt_json_boolean_null_values();
     std::cout << "=== All JWT tests passed ===\n\n";
 }

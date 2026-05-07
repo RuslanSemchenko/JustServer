@@ -73,37 +73,215 @@ std::optional<std::string> JwtValidator::base64url_decode(std::string_view input
     return output;
 }
 
-std::optional<std::string> JwtValidator::json_get_string(std::string_view json, std::string_view key) {
-    // Simple JSON string extraction (no nested objects)
-    std::string search = "\"" + std::string(key) + "\"";
-    auto pos = json.find(search);
-    if (pos == std::string_view::npos) return std::nullopt;
+// Parse a JSON string token starting at pos (must point to opening '"').
+// Returns the unescaped string and advances pos past the closing '"'.
+std::optional<std::string> JwtValidator::parse_json_string(std::string_view json, size_t& pos) {
+    if (pos >= json.size() || json[pos] != '"') return std::nullopt;
+    ++pos; // skip opening quote
 
-    pos += search.size();
-    // Skip whitespace and colon
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) ++pos;
-    if (pos >= json.size()) return std::nullopt;
+    std::string result;
+    result.reserve(32);
 
-    if (json[pos] == '"') {
-        // String value
+    while (pos < json.size()) {
+        char c = json[pos];
+        if (c == '"') {
+            ++pos; // skip closing quote
+            return result;
+        }
+        if (c == '\\') {
+            ++pos;
+            if (pos >= json.size()) return std::nullopt;
+            char esc = json[pos];
+            switch (esc) {
+                case '"':  result += '"'; break;
+                case '\\': result += '\\'; break;
+                case '/':  result += '/'; break;
+                case 'b':  result += '\b'; break;
+                case 'f':  result += '\f'; break;
+                case 'n':  result += '\n'; break;
+                case 'r':  result += '\r'; break;
+                case 't':  result += '\t'; break;
+                case 'u': {
+                    // \uXXXX unicode escape
+                    if (pos + 4 >= json.size()) return std::nullopt;
+                    uint32_t cp = 0;
+                    for (int i = 1; i <= 4; ++i) {
+                        char h = json[pos + i];
+                        cp <<= 4;
+                        if (h >= '0' && h <= '9') cp |= (h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |= (h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |= (h - 'A' + 10);
+                        else return std::nullopt;
+                    }
+                    pos += 4;
+                    // Encode as UTF-8
+                    if (cp < 0x80) {
+                        result += static_cast<char>(cp);
+                    } else if (cp < 0x800) {
+                        result += static_cast<char>(0xC0 | (cp >> 6));
+                        result += static_cast<char>(0x80 | (cp & 0x3F));
+                    } else {
+                        result += static_cast<char>(0xE0 | (cp >> 12));
+                        result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                        result += static_cast<char>(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default: return std::nullopt; // Invalid escape
+            }
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            return std::nullopt; // Control characters not allowed in JSON strings
+        } else {
+            result += c;
+        }
         ++pos;
-        auto end = json.find('"', pos);
-        if (end == std::string_view::npos) return std::nullopt;
-        return std::string(json.substr(pos, end - pos));
     }
+    return std::nullopt; // Unterminated string
+}
 
-    // Number as string
-    auto end = pos;
-    while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != ' ') ++end;
-    return std::string(json.substr(pos, end - pos));
+// Skip a JSON value starting at pos (string, number, object, array, bool, null).
+bool JwtValidator::skip_json_value(std::string_view json, size_t& pos) {
+    // Skip whitespace
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' ||
+           json[pos] == '\n' || json[pos] == '\r')) ++pos;
+    if (pos >= json.size()) return false;
+
+    char c = json[pos];
+    if (c == '"') {
+        // String
+        auto s = parse_json_string(json, pos);
+        return s.has_value();
+    } else if (c == '{') {
+        // Object -- track nesting depth
+        int depth = 1;
+        ++pos;
+        while (pos < json.size() && depth > 0) {
+            if (json[pos] == '"') {
+                auto s = parse_json_string(json, pos);
+                if (!s) return false;
+                continue; // pos already advanced
+            }
+            if (json[pos] == '{') ++depth;
+            else if (json[pos] == '}') --depth;
+            ++pos;
+        }
+        return depth == 0;
+    } else if (c == '[') {
+        // Array -- track nesting depth
+        int depth = 1;
+        ++pos;
+        while (pos < json.size() && depth > 0) {
+            if (json[pos] == '"') {
+                auto s = parse_json_string(json, pos);
+                if (!s) return false;
+                continue;
+            }
+            if (json[pos] == '[') ++depth;
+            else if (json[pos] == ']') --depth;
+            ++pos;
+        }
+        return depth == 0;
+    } else if (c == '-' || (c >= '0' && c <= '9')) {
+        // Number
+        if (c == '-') ++pos;
+        if (pos >= json.size()) return false;
+        while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') ++pos;
+        if (pos < json.size() && json[pos] == '.') {
+            ++pos;
+            while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') ++pos;
+        }
+        if (pos < json.size() && (json[pos] == 'e' || json[pos] == 'E')) {
+            ++pos;
+            if (pos < json.size() && (json[pos] == '+' || json[pos] == '-')) ++pos;
+            while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') ++pos;
+        }
+        return true;
+    } else if (json.substr(pos).starts_with("true")) {
+        pos += 4; return true;
+    } else if (json.substr(pos).starts_with("false")) {
+        pos += 5; return true;
+    } else if (json.substr(pos).starts_with("null")) {
+        pos += 4; return true;
+    }
+    return false;
+}
+
+// Skip whitespace helper
+static void skip_ws(std::string_view json, size_t& pos) {
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' ||
+           json[pos] == '\n' || json[pos] == '\r')) ++pos;
+}
+
+// State-machine JSON parser: find a top-level key in a JSON object and return
+// its value as a string.  For string values, returns the unescaped content.
+// For numbers/bools/null, returns the raw text representation.
+// Correctly handles escaped quotes, nested objects/arrays, and distinguishes
+// keys from values -- fixing the old find()-based bypass vulnerability.
+std::optional<std::string> JwtValidator::json_get_string(std::string_view json, std::string_view key) {
+    size_t pos = 0;
+    skip_ws(json, pos);
+
+    // Expect opening '{'
+    if (pos >= json.size() || json[pos] != '{') return std::nullopt;
+    ++pos;
+
+    while (pos < json.size()) {
+        skip_ws(json, pos);
+        if (pos >= json.size()) return std::nullopt;
+        if (json[pos] == '}') return std::nullopt; // key not found
+
+        // Parse key (must be a string)
+        auto parsed_key = parse_json_string(json, pos);
+        if (!parsed_key) return std::nullopt;
+
+        // Expect ':'
+        skip_ws(json, pos);
+        if (pos >= json.size() || json[pos] != ':') return std::nullopt;
+        ++pos;
+        skip_ws(json, pos);
+
+        if (*parsed_key == key) {
+            // This is the key we want -- extract the value
+            if (pos >= json.size()) return std::nullopt;
+
+            if (json[pos] == '"') {
+                // String value
+                return parse_json_string(json, pos);
+            }
+
+            // Non-string value: capture the raw text
+            size_t val_start = pos;
+            if (!skip_json_value(json, pos)) return std::nullopt;
+            return std::string(json.substr(val_start, pos - val_start));
+        }
+
+        // Not the key we want -- skip the value
+        if (!skip_json_value(json, pos)) return std::nullopt;
+
+        // Expect ',' or '}'
+        skip_ws(json, pos);
+        if (pos >= json.size()) return std::nullopt;
+        if (json[pos] == ',') { ++pos; continue; }
+        if (json[pos] == '}') return std::nullopt; // key not found
+        return std::nullopt; // malformed JSON
+    }
+    return std::nullopt;
 }
 
 std::optional<int64_t> JwtValidator::json_get_number(std::string_view json, std::string_view key) {
     auto str = json_get_string(json, key);
     if (!str) return std::nullopt;
 
+    // Trim whitespace from raw number text
+    std::string_view sv = *str;
+    while (!sv.empty() && sv.front() == ' ') sv.remove_prefix(1);
+    while (!sv.empty() && sv.back() == ' ') sv.remove_suffix(1);
+
     try {
-        return std::stoll(*str);
+        size_t consumed = 0;
+        int64_t val = std::stoll(std::string(sv), &consumed);
+        if (consumed == 0) return std::nullopt;
+        return val;
     } catch (...) {
         return std::nullopt;
     }

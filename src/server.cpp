@@ -4,6 +4,7 @@
 
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -11,6 +12,17 @@
 #include <fcntl.h>
 #include <csignal>
 #include <cstring>
+#include <grp.h>
+#include <pwd.h>
+
+#ifdef __linux__
+#include <sys/prctl.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+// syscall numbers
+#include <sys/syscall.h>
+#endif
 
 namespace js {
 
@@ -23,7 +35,12 @@ static bool set_nonblocking(int fd) {
 Server::Server(Config config, std::string config_path)
     : config_(std::move(config))
     , config_path_(std::move(config_path))
-    , ddos_(config_.max_connections_per_ip)
+    , ddos_(DDoSGuard::Config{
+        config_.max_connections_per_ip,
+        config_.max_total_connections,
+        config_.rate_limit_rps,
+        config_.rate_limit_burst
+      })
     , file_handler_(config_) {
 
     if (config_.fastcgi_enabled) {
@@ -155,19 +172,239 @@ bool Server::setup_listener() {
 }
 
 bool Server::apply_security() {
-    // Chroot if enabled (must be root)
+    // --- RLIMIT: cap memory and file descriptors ---
+    {
+        struct rlimit rl{};
+
+        // RLIMIT_AS: virtual address space limit
+        if (config_.max_memory_bytes > 0) {
+            rl.rlim_cur = config_.max_memory_bytes;
+            rl.rlim_max = config_.max_memory_bytes;
+            if (setrlimit(RLIMIT_AS, &rl) == 0) {
+                LOG_INFO("RLIMIT_AS set to " + std::to_string(config_.max_memory_bytes / (1024*1024)) + " MB");
+            } else {
+                LOG_WARN("Failed to set RLIMIT_AS: " + std::string(strerror(errno)));
+            }
+        }
+
+        // RLIMIT_NOFILE: max open file descriptors
+        if (config_.max_open_files > 0) {
+            rl.rlim_cur = static_cast<rlim_t>(config_.max_open_files);
+            rl.rlim_max = static_cast<rlim_t>(config_.max_open_files);
+            if (setrlimit(RLIMIT_NOFILE, &rl) == 0) {
+                LOG_INFO("RLIMIT_NOFILE set to " + std::to_string(config_.max_open_files));
+            } else {
+                LOG_WARN("Failed to set RLIMIT_NOFILE: " + std::string(strerror(errno)));
+            }
+        }
+    }
+
+    // --- Chroot if enabled (must be root, must happen before privilege drop) ---
     if (config_.chroot_enabled) {
         if (chroot(config_.document_root.c_str()) != 0) {
             LOG_WARN("Failed to chroot (requires root): " + std::string(strerror(errno)));
         } else {
             LOG_INFO("Chroot to: " + config_.document_root.string());
-            // After chroot, document root is /
             config_.document_root = "/";
+        }
+    }
+
+    // --- Drop privileges: setgid then setuid (order matters!) ---
+    // This must happen AFTER bind(), TLS cert loading, and chroot().
+    if (config_.drop_gid >= 0) {
+        gid_t gid = static_cast<gid_t>(config_.drop_gid);
+        if (setgroups(0, nullptr) != 0) {
+            LOG_WARN("Failed to clear supplementary groups: " + std::string(strerror(errno)));
+        }
+        if (setgid(gid) != 0) {
+            LOG_WARN("Failed to setgid(" + std::to_string(gid) + "): " + std::string(strerror(errno)));
+        } else {
+            LOG_INFO("Dropped group privileges to GID " + std::to_string(gid));
+        }
+    }
+    if (config_.drop_uid >= 0) {
+        uid_t uid = static_cast<uid_t>(config_.drop_uid);
+        if (setuid(uid) != 0) {
+            LOG_WARN("Failed to setuid(" + std::to_string(uid) + "): " + std::string(strerror(errno)));
+        } else {
+            LOG_INFO("Dropped user privileges to UID " + std::to_string(uid));
+            // Verify we cannot re-escalate
+            if (setuid(0) == 0) {
+                LOG_ERROR("CRITICAL: was able to regain root after setuid -- aborting");
+                return false;
+            }
         }
     }
 
     // Ignore SIGPIPE (broken pipe from client disconnect)
     signal(SIGPIPE, SIG_IGN);
+
+#ifdef __linux__
+    // --- seccomp: restrict syscalls to a safe allowlist ---
+    // Only enable if we successfully dropped privileges (running as non-root)
+    if (config_.drop_uid >= 0 && getuid() != 0) {
+        // Use seccomp strict mode with BPF filter
+        // Allow essential syscalls for a network server
+        struct sock_filter filter[] = {
+            // Load syscall number
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+
+            // Allow networking
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_read, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_write, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_close, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_sendto, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_recvfrom, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_sendmsg, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_recvmsg, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_accept4, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_socket, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_connect, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_setsockopt, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getsockopt, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_shutdown, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Allow epoll
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_epoll_wait, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_epoll_ctl, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_epoll_pwait, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_poll, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Allow file operations (for static file serving & logging)
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_openat, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fstat, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_newfstatat, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_lseek, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_sendfile, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getdents64, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Allow memory management
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_mmap, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_munmap, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_mprotect, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_brk, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_mremap, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Allow threading / futex
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_futex, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_set_robust_list, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rseq, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Allow time / clock
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clock_gettime, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_gettimeofday, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_nanosleep, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clock_nanosleep, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Allow signal handling
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rt_sigaction, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rt_sigprocmask, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rt_sigreturn, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Allow io_uring
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_setup, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_enter, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_register, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Allow misc needed syscalls
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit_group, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fcntl, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ioctl, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getrandom, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpid, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_gettid, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_tgkill, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_writev, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_readv, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_pread64, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_pwrite64, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_madvise, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getuid, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getgid, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+            // Default: log and deny (SECCOMP_RET_LOG requires kernel 4.14+,
+            // falls back to ERRNO on older kernels)
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        };
+
+        struct sock_fprog prog = {
+            .len = static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])),
+            .filter = filter,
+        };
+
+        // Allow ourselves to install the filter
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0) {
+            if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == 0) {
+                LOG_INFO("seccomp BPF filter installed: syscall allowlist active");
+            } else {
+                LOG_WARN("Failed to install seccomp filter: " + std::string(strerror(errno)));
+            }
+        } else {
+            LOG_WARN("Failed to set PR_SET_NO_NEW_PRIVS: " + std::string(strerror(errno)));
+        }
+    }
+#endif
 
     return true;
 }

@@ -39,7 +39,7 @@ private:
     bool try_sendfile(int client_fd, const HttpRequest& req);
 
     // Route request to appropriate handler
-    HttpResponse route_request(const HttpRequest& req);
+    HttpResponse route_request(const HttpRequest& req, const std::string& client_ip = "");
 
     // Apply security headers to response
     void apply_security_headers(HttpResponse& resp) const;

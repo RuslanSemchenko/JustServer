@@ -145,9 +145,6 @@ std::optional<WsFrame> WsConnection::parse_frame() {
     if (buffer_.size() < pos + 4) return std::nullopt;
     std::memcpy(frame.mask_key, buffer_.data() + pos, 4);
     pos += 4;
-    if (buffer_.size() < pos + 4) return std::nullopt;
-    std::memcpy(frame.mask_key, buffer_.data() + pos, 4);
-    pos += 4;
 
     // Read payload
     if (buffer_.size() < pos + payload_len) return std::nullopt;

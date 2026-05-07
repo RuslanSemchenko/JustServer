@@ -52,6 +52,25 @@ struct Config {
     int request_body_timeout_ms = 10000;
     int max_request_size = 8 * 1024 * 1024; // 8 MB
 
+    // Rate limiting (token bucket per IP)
+    double rate_limit_rps = 10.0;      // Requests per second per IP
+    double rate_limit_burst = 50.0;    // Burst capacity
+
+    // Global limits
+    int max_total_connections = 10000;          // Hard cap on total connections
+    size_t max_memory_bytes = 2ULL * 1024 * 1024 * 1024; // 2 GB RLIMIT_AS
+    int max_open_files = 65536;                // RLIMIT_NOFILE
+
+    // Privilege dropping
+    int drop_uid = -1;   // UID to drop to after bind (-1 = don't drop)
+    int drop_gid = -1;   // GID to drop to after bind (-1 = don't drop)
+
+    // Metrics access control
+    bool metrics_localhost_only = true; // Only serve /metrics to 127.0.0.1
+
+    // Server identity
+    std::string server_header;  // Empty = no Server header; set to e.g. "web"
+
     // File serving
     std::filesystem::path document_root = "/var/www/html";
     std::string index_file = "index.html";

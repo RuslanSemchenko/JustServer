@@ -140,9 +140,9 @@ sudo apt install cmake libssl-dev libre2-dev liburing-dev \
   libbrotli-dev libzstd-dev pkg-config
 
 # Install Clang 22
-wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
-tar xf LLVM-22.1.4-Linux-X64.tar.xz
-export PATH="$PWD/LLVM-22.1.4-Linux-X64/bin:$PATH"
+wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-Linux-X64.tar.xz"
+tar xf LLVM-22.1.5-Linux-X64.tar.xz
+export PATH="$PWD/LLVM-22.1.5-Linux-X64/bin:$PATH"
 
 # Build
 mkdir build && cd build

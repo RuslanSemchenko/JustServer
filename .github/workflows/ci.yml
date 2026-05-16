@@ -30,9 +30,9 @@ jobs:
 
       - name: Install Clang 22
         run: |
-          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
-          tar xf LLVM-22.1.4-Linux-X64.tar.xz
-          echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-Linux-X64.tar.xz"
+          tar xf LLVM-22.1.5-Linux-X64.tar.xz
+          echo "$PWD/LLVM-22.1.5-Linux-X64/bin" >> $GITHUB_PATH
 
       - name: Build ngtcp2 & nghttp3
         run: |
@@ -85,9 +85,9 @@ jobs:
 
       - name: Install Clang 22
         run: |
-          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
-          tar xf LLVM-22.1.4-Linux-X64.tar.xz
-          echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-Linux-X64.tar.xz"
+          tar xf LLVM-22.1.5-Linux-X64.tar.xz
+          echo "$PWD/LLVM-22.1.5-Linux-X64/bin" >> $GITHUB_PATH
 
       - name: Build ngtcp2 & nghttp3
         run: |
@@ -140,9 +140,9 @@ jobs:
 
       - name: Install Clang 22
         run: |
-          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.4/LLVM-22.1.4-Linux-X64.tar.xz"
-          tar xf LLVM-22.1.4-Linux-X64.tar.xz
-          echo "$PWD/LLVM-22.1.4-Linux-X64/bin" >> $GITHUB_PATH
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-Linux-X64.tar.xz"
+          tar xf LLVM-22.1.5-Linux-X64.tar.xz
+          echo "$PWD/LLVM-22.1.5-Linux-X64/bin" >> $GITHUB_PATH
 
       - name: Build ngtcp2 & nghttp3
         run: |

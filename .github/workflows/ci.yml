@@ -173,11 +173,11 @@ jobs:
       - name: Build fuzz targets
         run: cmake --build build-fuzz -j$(nproc)
 
-      - name: Fuzz HTTP/1.1 parser (300s)
-        run: timeout 300 ./build-fuzz/fuzz_http_parser -max_len=8192 || true
+      - name: Fuzz HTTP/1.1 parser (3000s)
+        run: timeout 3000 ./build-fuzz/fuzz_http_parser -max_len=8192 || true
 
-      - name: Fuzz HTTP/2 + HPACK (300s)
-        run: timeout 300 ./build-fuzz/fuzz_http2 -max_len=16384 || true
+      - name: Fuzz HTTP/2 + HPACK (3000s)
+        run: timeout 3000 ./build-fuzz/fuzz_http2 -max_len=16384 || true
 
-      - name: Fuzz WAF engine (300s)
-        run: timeout 300 ./build-fuzz/fuzz_waf -max_len=4096 || true
+      - name: Fuzz WAF engine (3000s)
+        run: timeout 3000 ./build-fuzz/fuzz_waf -max_len=4096 || true

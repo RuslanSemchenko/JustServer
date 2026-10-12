@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-and-test:
-    name: Build & Test (Clang 22, ${{ matrix.build_type }})
+    name: Build & Test (Clang 23, ${{ matrix.build_type }})
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -30,9 +30,9 @@ jobs:
 
       - name: Install Clang 22
         run: |
-          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-Linux-X64.tar.xz"
-          tar xf LLVM-22.1.5-Linux-X64.tar.xz
-          echo "$PWD/LLVM-22.1.5-Linux-X64/bin" >> $GITHUB_PATH
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-X64.tar.xz"
+          tar xf LLVM-23.1.3-Linux-X64.tar.xz
+          echo "$PWD/LLVM-23.1.3-Linux-X64/bin" >> $GITHUB_PATH
 
       - name: Build ngtcp2 & nghttp3
         run: |
@@ -85,9 +85,9 @@ jobs:
 
       - name: Install Clang 22
         run: |
-          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-Linux-X64.tar.xz"
-          tar xf LLVM-22.1.5-Linux-X64.tar.xz
-          echo "$PWD/LLVM-22.1.5-Linux-X64/bin" >> $GITHUB_PATH
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-X64.tar.xz"
+          tar xf LLVM-23.1.3-Linux-X64.tar.xz
+          echo "$PWD/LLVM-23.1.3-Linux-X64/bin" >> $GITHUB_PATH
 
       - name: Build ngtcp2 & nghttp3
         run: |
@@ -140,9 +140,9 @@ jobs:
 
       - name: Install Clang 22
         run: |
-          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-Linux-X64.tar.xz"
-          tar xf LLVM-22.1.5-Linux-X64.tar.xz
-          echo "$PWD/LLVM-22.1.5-Linux-X64/bin" >> $GITHUB_PATH
+          wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-X64.tar.xz"
+          tar xf LLVM-23.1.3-Linux-X64.tar.xz
+          echo "$PWD/LLVM-23.1.3-Linux-X64/bin" >> $GITHUB_PATH
 
       - name: Build ngtcp2 & nghttp3
         run: |
@@ -180,4 +180,4 @@ jobs:
         run: timeout 3000 ./build-fuzz/fuzz_http2 -max_len=16384 || true
 
       - name: Fuzz WAF engine (3000s)
-        run: timeout 3000 ./build-fuzz/fuzz_waf -max_len=4096 || true
+        run: timeout 3000 ./build-fuzz/fuzz_waf -max_len=8192 || true

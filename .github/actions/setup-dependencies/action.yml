@@ -24,6 +24,7 @@ runs:
       shell: bash
       run: |
         git clone --depth 1 https://github.com/ngtcp2/nghttp3.git /tmp/nghttp3
+        git -C /tmp/nghttp3 submodule update --init --recursive
         cmake -S /tmp/nghttp3 -B /tmp/nghttp3/build \
           -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF
         cmake --build /tmp/nghttp3/build --parallel "$(nproc)"
@@ -33,6 +34,7 @@ runs:
       shell: bash
       run: |
         git clone --depth 1 https://github.com/ngtcp2/ngtcp2.git /tmp/ngtcp2
+        git -C /tmp/ngtcp2 submodule update --init --recursive
         cmake -S /tmp/ngtcp2 -B /tmp/ngtcp2/build \
           -DENABLE_OPENSSL=OFF \
           -DENABLE_GNUTLS=ON \

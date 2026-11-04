@@ -137,10 +137,19 @@ enum class H2StreamState {
 struct H2Stream {
     uint32_t id = 0;
     H2StreamState state = H2StreamState::IDLE;
-    int32_t window_size = 65535;
-    std::string header_block;    // Accumulated header fragments
-    HttpRequest request;         // Decoded request
+    int32_t window_size = 65535;           // Send window: DATA bytes we may still send on this stream
+    std::string header_block;              // Accumulated header fragments (HEADERS + CONTINUATION)
+    bool header_block_end_stream = false;  // END_STREAM flag of the HEADERS frame that opened the block
+    HttpRequest request;                   // Decoded request
     bool headers_complete = false;
+    bool request_dispatched = false;
+
+    // Outgoing response, queued until the peer's flow-control windows allow sending
+    bool response_queued = false;
+    bool response_done = false;
+    std::string out_data;
+    size_t out_offset = 0;
+    std::vector<std::pair<std::string, std::string>> out_trailers;
 };
 
 // HTTP/2 Connection Handler
@@ -156,8 +165,23 @@ public:
     // Check if connection is still alive
     bool is_alive() const { return !goaway_sent_; }
 
+    // Maximum accepted request body per stream (larger requests get 413)
+    void set_max_request_body(size_t bytes) { max_request_body_ = bytes; }
+
+    // True while some response data is waiting for flow-control credit from the peer
+    bool has_pending_output() const;
+
+    // Number of streams currently tracked (open or with a response in flight)
+    size_t active_streams() const { return streams_.size(); }
+
     // Get the connection preface to verify
     static constexpr std::string_view CLIENT_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    // Limits we advertise in our SETTINGS frame
+    static constexpr uint32_t LOCAL_MAX_CONCURRENT_STREAMS = 100;
+    static constexpr uint32_t LOCAL_INITIAL_WINDOW_SIZE = 65535;
+    static constexpr uint32_t LOCAL_MAX_FRAME_SIZE = 16384;
+    static constexpr size_t MAX_HEADER_BLOCK_SIZE = 64 * 1024;
 
 private:
     // Parse a frame from buffer
@@ -167,21 +191,29 @@ private:
     std::string handle_frame(const H2Frame& frame);
     std::string handle_settings(const H2Frame& frame);
     std::string handle_headers(const H2Frame& frame);
+    std::string handle_continuation(const H2Frame& frame);
     std::string handle_data(const H2Frame& frame);
     std::string handle_window_update(const H2Frame& frame);
+    std::string handle_rst_stream(const H2Frame& frame);
     std::string handle_ping(const H2Frame& frame);
     std::string handle_goaway(const H2Frame& frame);
+
+    // Request/response processing
+    std::string finish_header_block(H2Stream& stream);
+    std::string dispatch_request(H2Stream& stream);
+    std::string queue_response(H2Stream& stream, const HttpResponse& resp);
+    std::string flush_stream(H2Stream& stream);
+    std::string flush_all();
+    void erase_stream_if_finished(uint32_t stream_id);
 
     // Build frames
     static std::string build_frame(H2FrameType type, uint8_t flags, uint32_t stream_id,
                                    std::string_view payload);
     std::string build_settings_frame(bool ack = false);
-    std::string build_headers_response(uint32_t stream_id, const HttpResponse& resp);
-    std::string build_data_frame(uint32_t stream_id, std::string_view data, bool end_stream);
+    std::string build_header_frames(uint32_t stream_id, std::string_view block, bool end_stream) const;
+    static std::string build_rst_stream(uint32_t stream_id, H2Error error);
+    static std::string build_window_update(uint32_t stream_id, uint32_t increment);
     std::string build_goaway(H2Error error, std::string_view debug = "");
-
-    // Stream management
-    H2Stream& get_or_create_stream(uint32_t stream_id);
 
     RequestHandler handler_;
     HPACKDecoder decoder_;
@@ -192,10 +224,13 @@ private:
     bool preface_received_ = false;
     bool settings_sent_ = false;
     bool goaway_sent_ = false;
+    bool frame_size_error_ = false;
     uint32_t last_stream_id_ = 0;
-    int32_t connection_window_ = 65535;
+    uint32_t continuation_stream_id_ = 0;  // Non-zero while a header block awaits CONTINUATION
+    int32_t connection_window_ = 65535;    // Connection-level send window
+    size_t max_request_body_ = 8 * 1024 * 1024;
 
-    // Connection settings
+    // Peer settings (limits for what WE send)
     uint32_t max_frame_size_ = 16384;
     uint32_t max_concurrent_streams_ = 100;
     uint32_t header_table_size_ = 4096;

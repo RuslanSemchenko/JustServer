@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/resource.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -12,6 +13,11 @@
 #include <fcntl.h>
 #include <csignal>
 #include <cstring>
+#include <poll.h>
+#include <chrono>
+#include <array>
+#include <filesystem>
+#include <sstream>
 #include <grp.h>
 #include <pwd.h>
 
@@ -41,6 +47,19 @@ Server::Server(Config config, std::string config_path)
         config_.rate_limit_rps,
         config_.rate_limit_burst
       })
+    , geoip_filter_(GeoIPFilter::Config{
+        config_.geoip_database_path,
+        config_.geoip_blocked_countries,
+        false,
+        false,
+        false
+      })
+    , plugin_manager_(PluginManager::Config{
+        config_.wasm_plugin_dir,
+        config_.wasm_max_memory_bytes,
+        std::chrono::milliseconds{config_.wasm_execution_timeout_ms},
+        config_.wasm_enabled
+      })
     , file_handler_(config_) {
 
     if (config_.fastcgi_enabled) {
@@ -50,8 +69,11 @@ Server::Server(Config config, std::string config_path)
 
 Server::~Server() {
     stop();
+    if (acme_challenge_thread_.joinable()) acme_challenge_thread_.join();
+    if (acme_renewal_thread_.joinable()) acme_renewal_thread_.join();
     if (listen_fd_ >= 0) close(listen_fd_);
     if (epoll_fd_ >= 0) close(epoll_fd_);
+    if (acme_listener_fd_ >= 0) close(acme_listener_fd_);
 }
 
 bool Server::start() {
@@ -67,20 +89,118 @@ bool Server::start() {
     LOG_INFO("FastCGI: " + std::string(config_.fastcgi_enabled ? config_.fastcgi_socket : "disabled"));
     LOG_INFO("Sendfile: enabled (zero-copy for static files)");
     LOG_INFO("HTTP/2: enabled (HPACK with Huffman, ALPN negotiation)");
+    LOG_INFO("HTTP/3: " + std::string(config_.http3_enabled ? "enabled" : "disabled"));
     LOG_INFO("Security headers: " + std::string(config_.security_headers.enabled ? "enabled (CSP, HSTS, X-Content-Type-Options)" : "disabled"));
     LOG_INFO("Metrics: enabled at /metrics (Prometheus format)");
     LOG_INFO("Hot reload: SIGHUP supported");
+    if (!plugin_manager_.load_plugins()) {
+        LOG_ERROR("Failed to load WASM plugins");
+        return false;
+    }
+
+    if (config_.geoip_enabled && !geoip_filter_.load_database()) {
+        LOG_ERROR("GeoIP is enabled but its database could not be loaded");
+        return false;
+    }
+
+    if (config_.acme_enabled) {
+        if (!config_.tls_enabled || config_.acme_domains.empty() || config_.chroot_enabled ||
+            config_.port == 80) {
+            LOG_ERROR("ACME requires TLS, a non-port-80 application listener, at least one "
+                      "domain, and chroot to be disabled");
+            return false;
+        }
+        AcmeClient::Config acme_config;
+        acme_config.directory_url = config_.acme_directory_url;
+        acme_config.email = config_.acme_email;
+        acme_config.domains = config_.acme_domains;
+        acme_config.storage_path = config_.acme_storage_path;
+        acme_config.use_staging = config_.acme_use_staging;
+        acme_client_ = std::make_unique<AcmeClient>(std::move(acme_config));
+        if (!acme_client_->initialize()) {
+            LOG_ERROR("Failed to initialize ACME client");
+            return false;
+        }
+        if (!setup_acme_challenge_listener()) {
+            LOG_ERROR("Failed to bind HTTP-01 challenge listener on port 80");
+            return false;
+        }
+        acme_listener_running_ = true;
+        acme_challenge_thread_ = std::thread(&Server::acme_challenge_loop, this);
+        if (!acme_client_->obtain_certificates()) {
+            LOG_ERROR("Failed to obtain configured ACME certificates");
+            acme_listener_running_ = false;
+            shutdown(acme_listener_fd_, SHUT_RDWR);
+            if (acme_challenge_thread_.joinable()) acme_challenge_thread_.join();
+            return false;
+        }
+        auto cert = acme_client_->get_certificate(config_.acme_domains.front());
+        if (!cert || !cert->valid) {
+            LOG_ERROR("ACME did not provide a valid certificate for the primary domain");
+            return false;
+        }
+        auto domain_dir = std::filesystem::path(config_.acme_storage_path) /
+                          config_.acme_domains.front();
+        config_.tls_cert_path = (domain_dir / "cert.pem").string();
+        config_.tls_key_path = (domain_dir / "key.pem").string();
+        acme_client_->set_cert_updated_callback([this, primary = config_.acme_domains.front()](
+                const std::string& domain, const AcmeClient::CertInfo&) {
+            if (domain != primary || !tls_ready_) return;
+            if (!tls_.init(config_.tls_cert_path, config_.tls_key_path)) {
+                LOG_ERROR("Failed to reload TLS certificate after ACME renewal");
+            }
+            if (http3_dispatcher_ && !http3_dispatcher_->reload_tls_credentials()) {
+                LOG_ERROR("Failed to reload HTTP/3 TLS credentials after ACME renewal");
+            }
+        });
+    }
 
     // Initialize TLS if enabled
     if (config_.tls_enabled) {
         if (!tls_.init(config_.tls_cert_path, config_.tls_key_path)) {
+            if (config_.acme_enabled) {
+                LOG_ERROR("Failed to initialize TLS with the ACME certificate");
+                return false;
+            }
             LOG_ERROR("Failed to initialize TLS. Continuing without TLS.");
             config_.tls_enabled = false;
+        } else {
+            tls_ready_ = true;
+        }
+    }
+
+    if (config_.http3_enabled) {
+        if (!config_.tls_enabled) {
+            LOG_ERROR("HTTP/3 requires TLS to be enabled");
+            return false;
+        }
+
+        QuicDispatcher::Config http3_config;
+        http3_config.bind_address = config_.bind_address;
+        http3_config.port = config_.http3_port == 0 ? config_.port : config_.http3_port;
+        http3_config.tls_cert_path = config_.tls_cert_path;
+        http3_config.tls_key_path = config_.tls_key_path;
+        http3_config.max_connections = static_cast<size_t>(config_.max_total_connections);
+        http3_config.transport_params.max_request_size_bytes =
+            static_cast<size_t>(config_.max_request_size);
+        http3_dispatcher_ = std::make_unique<QuicDispatcher>(
+            std::move(http3_config),
+            [this](const HttpRequest& req, const std::string& client_ip) {
+                Worker worker(config_, &tls_, &waf_, &ddos_, &file_handler_, fcgi_.get(),
+                              &geoip_filter_, &plugin_manager_);
+                return worker.handle_http3_request(req, client_ip);
+            });
+        if (!http3_dispatcher_->init()) {
+            LOG_ERROR("Failed to initialize HTTP/3 dispatcher");
+            return false;
         }
     }
 
     // Apply security restrictions
-    apply_security();
+    if (!apply_security()) {
+        LOG_ERROR("Failed to apply security restrictions");
+        return false;
+    }
 
     // Setup listener
     if (!setup_listener()) {
@@ -93,6 +213,9 @@ bool Server::start() {
     for (int i = 0; i < config_.worker_threads; ++i) {
         workers_.emplace_back(&Server::worker_thread_func, this);
     }
+    if (acme_client_) {
+        acme_renewal_thread_ = std::thread(&Server::acme_renewal_loop, this);
+    }
 
     LOG_INFO("Server ready. Listening on port " + std::to_string(config_.port));
 
@@ -103,6 +226,11 @@ bool Server::start() {
     for (auto& w : workers_) {
         if (w.joinable()) w.join();
     }
+    acme_renewal_cv_.notify_all();
+    if (acme_renewal_thread_.joinable()) acme_renewal_thread_.join();
+    acme_listener_running_ = false;
+    if (acme_listener_fd_ >= 0) shutdown(acme_listener_fd_, SHUT_RDWR);
+    if (acme_challenge_thread_.joinable()) acme_challenge_thread_.join();
 
     LOG_INFO("Server stopped.");
     return true;
@@ -110,6 +238,9 @@ bool Server::start() {
 
 void Server::stop() {
     running_ = false;
+    acme_listener_running_ = false;
+    if (acme_listener_fd_ >= 0) shutdown(acme_listener_fd_, SHUT_RDWR);
+    acme_renewal_cv_.notify_all();
     queue_cv_.notify_all();
 }
 
@@ -168,7 +299,112 @@ bool Server::setup_listener() {
         return false;
     }
 
+    if (http3_dispatcher_) {
+        ev = {};
+        ev.events = EPOLLIN;
+        ev.data.fd = http3_dispatcher_->socket_fd();
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, http3_dispatcher_->socket_fd(), &ev) < 0) {
+            LOG_ERROR("Failed to add HTTP/3 UDP socket to epoll: " +
+                      std::string(strerror(errno)));
+            return false;
+        }
+    }
+
     return true;
+}
+
+bool Server::setup_acme_challenge_listener() {
+    acme_listener_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (acme_listener_fd_ < 0) {
+        LOG_ERROR("ACME: failed to create challenge listener: " + std::string(strerror(errno)));
+        return false;
+    }
+    int reuse = 1;
+    setsockopt(acme_listener_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(80);
+    if (inet_pton(AF_INET, config_.bind_address.c_str(), &address.sin_addr) != 1) {
+        LOG_ERROR("ACME: HTTP-01 listener requires an IPv4 bind_address");
+        return false;
+    }
+    if (bind(acme_listener_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+        LOG_ERROR("ACME: failed to bind TCP port 80: " + std::string(strerror(errno)));
+        return false;
+    }
+    if (listen(acme_listener_fd_, config_.backlog) < 0) {
+        LOG_ERROR("ACME: failed to listen on TCP port 80: " + std::string(strerror(errno)));
+        return false;
+    }
+    LOG_INFO("ACME: HTTP-01 challenge listener is active on TCP port 80");
+    return true;
+}
+
+void Server::acme_challenge_loop() {
+    while (acme_listener_running_) {
+        pollfd event{acme_listener_fd_, POLLIN, 0};
+        int ready = poll(&event, 1, 500);
+        if (ready <= 0) continue;
+        int client = accept4(acme_listener_fd_, nullptr, nullptr, SOCK_CLOEXEC);
+        if (client < 0) continue;
+        timeval timeout{2, 0};
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        std::string request;
+        std::array<char, 1024> buffer{};
+        while (request.size() < 8192 && request.find("\r\n\r\n") == std::string::npos) {
+            ssize_t count = recv(client, buffer.data(), buffer.size(), 0);
+            if (count <= 0) break;
+            request.append(buffer.data(), static_cast<size_t>(count));
+        }
+
+        int status = 404;
+        std::string body = "Not Found\n";
+        auto line_end = request.find("\r\n");
+        if (line_end != std::string::npos) {
+            std::istringstream first_line(request.substr(0, line_end));
+            std::string method, target;
+            first_line >> method >> target;
+            constexpr std::string_view challenge_prefix = "/.well-known/acme-challenge/";
+            if (method == "GET" && target.starts_with(challenge_prefix) &&
+                target.find_first_of("?#", challenge_prefix.size()) == std::string::npos) {
+                auto token = target.substr(challenge_prefix.size());
+                if (!token.empty() && token.find('/') == std::string::npos) {
+                    auto key_authorization = acme_client_->handle_challenge(token);
+                    if (key_authorization) {
+                        status = 200;
+                        body = *key_authorization;
+                    }
+                }
+            }
+        }
+        auto reason = status == 200 ? "OK" : "Not Found";
+        auto response = "HTTP/1.1 " + std::to_string(status) + " " + reason +
+            "\r\nContent-Type: text/plain\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+        size_t sent = 0;
+        while (sent < response.size()) {
+            ssize_t count = send(client, response.data() + sent, response.size() - sent,
+                                 MSG_NOSIGNAL);
+            if (count <= 0) break;
+            sent += static_cast<size_t>(count);
+        }
+        close(client);
+    }
+}
+
+void Server::acme_renewal_loop() {
+    std::unique_lock lock(acme_renewal_mutex_);
+    while (running_) {
+        if (acme_renewal_cv_.wait_for(lock, std::chrono::hours(12),
+                                      [this] { return !running_.load(); })) {
+            break;
+        }
+        lock.unlock();
+        if (running_ && acme_client_ && !acme_client_->check_and_renew()) {
+            LOG_ERROR("ACME: automatic certificate renewal check failed");
+        }
+        lock.lock();
+    }
 }
 
 bool Server::apply_security() {
@@ -196,6 +432,37 @@ bool Server::apply_security() {
             } else {
                 LOG_WARN("Failed to set RLIMIT_NOFILE: " + std::string(strerror(errno)));
             }
+        }
+    }
+
+    if (acme_client_ && (config_.drop_uid >= 0 || config_.drop_gid >= 0)) {
+        uid_t owner = config_.drop_uid >= 0 ? static_cast<uid_t>(config_.drop_uid) : geteuid();
+        gid_t group = config_.drop_gid >= 0 ? static_cast<gid_t>(config_.drop_gid) : getegid();
+        std::error_code ec;
+        auto storage = std::filesystem::path(config_.acme_storage_path);
+        auto change_owner = [&](const std::filesystem::path& path) {
+            auto status = std::filesystem::symlink_status(path, ec);
+            if (ec || std::filesystem::is_symlink(status) ||
+                chown(path.c_str(), owner, group) != 0) {
+                LOG_ERROR("ACME: cannot prepare storage ownership for privilege drop: " +
+                          path.string() + (ec ? ": " + ec.message()
+                                              : ": " + std::string(strerror(errno))));
+                return false;
+            }
+            return true;
+        };
+        if (!change_owner(storage)) return false;
+        std::filesystem::recursive_directory_iterator it(storage, ec), end;
+        if (ec) {
+            LOG_ERROR("ACME: cannot inspect storage before privilege drop: " + ec.message());
+            return false;
+        }
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                LOG_ERROR("ACME: cannot inspect storage before privilege drop: " + ec.message());
+                return false;
+            }
+            if (!change_owner(it->path())) return false;
         }
     }
 
@@ -299,6 +566,16 @@ bool Server::apply_security() {
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_sendfile, 0, 1),
             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getdents64, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fchmod, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fchmodat, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fsync, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rename, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_unlink, 0, 1),
             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 
             // Allow memory management
@@ -439,7 +716,8 @@ void Server::event_loop() {
             }
         }
 
-        int nfds = epoll_wait(epoll_fd_, events, MAX_EVENTS, 1000);
+        int nfds = epoll_wait(epoll_fd_, events, MAX_EVENTS,
+                              http3_dispatcher_ ? 50 : 1000);
 
         if (nfds < 0) {
             if (errno == EINTR) continue;
@@ -483,13 +761,21 @@ void Server::event_loop() {
                     }
                     queue_cv_.notify_one();
                 }
+            } else if (http3_dispatcher_ &&
+                       events[i].data.fd == http3_dispatcher_->socket_fd()) {
+                http3_dispatcher_->process_packets();
             }
+        }
+        if (http3_dispatcher_) {
+            http3_dispatcher_->flush_output();
+            http3_dispatcher_->tick();
         }
     }
 }
 
 void Server::worker_thread_func() {
-    Worker worker(config_, &tls_, &waf_, &ddos_, &file_handler_, fcgi_.get());
+    Worker worker(config_, &tls_, &waf_, &ddos_, &file_handler_, fcgi_.get(),
+                  &geoip_filter_, &plugin_manager_);
 
     while (running_) {
         PendingConnection conn;

@@ -8,9 +8,11 @@
 
 #include <cstring>
 #include <cmath>
+#include <cctype>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <new>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <poll.h>
@@ -75,6 +77,105 @@ static std::string random_hex(size_t bytes) {
 
 // === TLS Fingerprinter ===
 
+namespace {
+
+bool is_grease_value(unsigned value) {
+    return (value & 0x0f0fU) == 0x0a0aU && ((value >> 8) & 0xffU) == (value & 0xffU);
+}
+
+void append_ja3_values(std::string& output, const unsigned char* data, size_t length,
+                       size_t value_width, size_t prefix_width) {
+    if (!data || length < prefix_width || value_width == 0) return;
+    size_t list_length = prefix_width == 0 ? length : 0;
+    for (size_t i = 0; i < prefix_width; ++i) list_length = (list_length << 8) | data[i];
+    if (list_length > length - prefix_width || list_length % value_width != 0) return;
+    for (size_t offset = prefix_width; offset < prefix_width + list_length;
+         offset += value_width) {
+        unsigned value = 0;
+        for (size_t i = 0; i < value_width; ++i) value = (value << 8) | data[offset + i];
+        if (is_grease_value(value)) continue;
+        if (!output.empty()) output += '-';
+        output += std::to_string(value);
+    }
+}
+
+int ja3_ex_data_index() {
+    static int index = SSL_get_ex_new_index(
+        0, nullptr, nullptr, nullptr,
+        [](void*, void* data, CRYPTO_EX_DATA*, int, long, void*) {
+            delete static_cast<std::string*>(data);
+        });
+    return index;
+}
+
+int capture_client_hello(SSL* ssl, int* alert, void*) {
+    if (!ssl) {
+        if (alert) *alert = SSL_AD_INTERNAL_ERROR;
+        return SSL_CLIENT_HELLO_ERROR;
+    }
+    try {
+        std::string raw = std::to_string(SSL_client_hello_get0_legacy_version(ssl)) + ",";
+
+        const unsigned char* ciphers = nullptr;
+        size_t cipher_length = SSL_client_hello_get0_ciphers(ssl, &ciphers);
+        std::string cipher_list;
+        append_ja3_values(cipher_list, ciphers, cipher_length, 2, 0);
+        raw += cipher_list + ",";
+
+        int* extensions = nullptr;
+        size_t extension_count = 0;
+        std::string extension_list;
+        if (SSL_client_hello_get1_extensions_present(ssl, &extensions, &extension_count) == 1) {
+            auto free_extensions = [](int* values) { OPENSSL_free(values); };
+            std::unique_ptr<int, decltype(free_extensions)> extension_guard(
+                extensions, free_extensions);
+            for (size_t i = 0; i < extension_count; ++i) {
+                unsigned value = static_cast<unsigned>(extensions[i]);
+                if (is_grease_value(value)) continue;
+                if (!extension_list.empty()) extension_list += '-';
+                extension_list += std::to_string(value);
+            }
+        }
+        raw += extension_list + ",";
+
+        const unsigned char* extension_data = nullptr;
+        size_t extension_length = 0;
+        std::string groups;
+        if (SSL_client_hello_get0_ext(ssl, 10, &extension_data, &extension_length) == 1) {
+            append_ja3_values(groups, extension_data, extension_length, 2, 2);
+        }
+        raw += groups + ",";
+
+        std::string point_formats;
+        if (SSL_client_hello_get0_ext(ssl, 11, &extension_data, &extension_length) == 1) {
+            append_ja3_values(point_formats, extension_data, extension_length, 1, 1);
+        }
+        raw += point_formats;
+
+        int index = ja3_ex_data_index();
+        if (index < 0) return SSL_CLIENT_HELLO_SUCCESS;
+        auto* previous = static_cast<std::string*>(SSL_get_ex_data(ssl, index));
+        if (previous) {
+            if (SSL_set_ex_data(ssl, index, nullptr) != 1) return SSL_CLIENT_HELLO_SUCCESS;
+            delete previous;
+        }
+        auto* stored = new (std::nothrow) std::string(std::move(raw));
+        if (!stored || SSL_set_ex_data(ssl, index, stored) != 1) {
+            delete stored;
+            return SSL_CLIENT_HELLO_SUCCESS;
+        }
+        return SSL_CLIENT_HELLO_SUCCESS;
+    } catch (const std::bad_alloc&) {
+        return SSL_CLIENT_HELLO_SUCCESS;
+    }
+}
+
+} // namespace
+
+void install_ja3_client_hello_capture(ssl_ctx_st* context) {
+    if (context) SSL_CTX_set_client_hello_cb(context, capture_client_hello, nullptr);
+}
+
 TlsFingerprinter::Fingerprint TlsFingerprinter::extract_ja3(ssl_st* ssl, const std::string& client_ip) {
     Fingerprint fp;
     fp.client_ip = client_ip;
@@ -84,34 +185,27 @@ TlsFingerprinter::Fingerprint TlsFingerprinter::extract_ja3(ssl_st* ssl, const s
         return fp;
     }
 
-    // Build JA3 string from SSL connection info
-    // JA3 = SSLVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats
-    std::string ja3;
-
-    // TLS version
-    int version = SSL_version(ssl);
-    ja3 += std::to_string(version);
-    ja3 += ',';
-
-    // Cipher suite (the negotiated one -- in a real implementation we'd capture
-    // the full ClientHello cipher list via an info callback)
-    const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl);
-    if (cipher) {
-        ja3 += std::to_string(SSL_CIPHER_get_protocol_id(cipher));
+    int index = ja3_ex_data_index();
+    auto* captured = index >= 0
+        ? static_cast<std::string*>(SSL_get_ex_data(ssl, index)) : nullptr;
+    if (captured) {
+        fp.ja3_raw = *captured;
+    } else {
+        std::string fallback = std::to_string(SSL_version(ssl)) + ",";
+        const STACK_OF(SSL_CIPHER)* ciphers = SSL_get_client_ciphers(ssl);
+        bool first_cipher = true;
+        if (ciphers) {
+            for (int i = 0; i < sk_SSL_CIPHER_num(ciphers); ++i) {
+                unsigned value = SSL_CIPHER_get_protocol_id(sk_SSL_CIPHER_value(ciphers, i));
+                if (is_grease_value(value)) continue;
+                if (!first_cipher) fallback += '-';
+                fallback += std::to_string(value);
+                first_cipher = false;
+            }
+        }
+        fp.ja3_raw = fallback + ",,,";
     }
-    ja3 += ',';
-
-    // Extensions, curves, point formats would be captured from ClientHello
-    // via SSL_CTX_set_info_callback or custom extension callbacks.
-    // For now, use what's available from the session.
-    ja3 += "0"; // placeholder extensions
-    ja3 += ',';
-    ja3 += "0"; // placeholder curves
-    ja3 += ',';
-    ja3 += "0"; // placeholder point formats
-
-    fp.ja3_raw = ja3;
-    fp.ja3_hash = md5_hex(ja3);
+    fp.ja3_hash = md5_hex(fp.ja3_raw);
     fp.is_known_bot = is_known_bot_fingerprint(fp.ja3_hash);
 
     return fp;
@@ -488,36 +582,13 @@ void Tarpit::drip_feed(int fd, const std::string& data) const {
 
 // === GeoIP Filter ===
 
-GeoIPFilter::GeoIPFilter() : config_{} {}
+GeoIPFilter::GeoIPFilter() : GeoIPFilter(Config{}) {}
 GeoIPFilter::GeoIPFilter(Config config) : config_(std::move(config)) {}
 
-std::optional<std::string> GeoIPFilter::lookup_country([[maybe_unused]] std::string_view ip) const {
-    // Full implementation would use a radix trie over MaxMind GeoLite2 data.
-    // This is a structural placeholder that shows the correct interface.
+std::optional<std::string> GeoIPFilter::lookup_country(std::string_view ip) const {
     std::lock_guard lock(mutex_);
-
-    // Parse IP to uint32
-    uint32_t ip_num = 0;
-    int octet = 0;
-    int shift = 24;
-    for (char c : ip) {
-        if (c == '.') {
-            ip_num |= (static_cast<uint32_t>(octet) << shift);
-            octet = 0;
-            shift -= 8;
-        } else if (c >= '0' && c <= '9') {
-            octet = octet * 10 + (c - '0');
-        }
-    }
-    ip_num |= static_cast<uint32_t>(octet);
-
-    // Binary search in sorted ranges
-    for (const auto& range : ranges_) {
-        if (ip_num >= range.start && ip_num <= range.end) {
-            return range.country;
-        }
-    }
-    return std::nullopt;
+    if (!database_) return std::nullopt;
+    return database_->lookup_country(ip);
 }
 
 bool GeoIPFilter::is_blocked(std::string_view ip) const {
@@ -527,16 +598,32 @@ bool GeoIPFilter::is_blocked(std::string_view ip) const {
     if (!country) return false;
 
     for (const auto& blocked : config_.blocked_countries) {
-        if (*country == blocked) return true;
+        if (blocked.size() != country->size()) continue;
+        bool matches = true;
+        for (size_t i = 0; i < blocked.size(); ++i) {
+            if (std::toupper(static_cast<unsigned char>(blocked[i])) != (*country)[i]) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
     }
     return false;
 }
 
 bool GeoIPFilter::load_database() {
-    // TODO: Parse MaxMind GeoLite2 CSV/MMDB into ranges_
-    LOG_INFO("GeoIP: Database loading from " + config_.database_path +
-             " (not implemented -- needs MaxMind integration)");
-    return false;
+    if (config_.database_path.empty()) {
+        LOG_ERROR("GeoIP: database path is empty");
+        return false;
+    }
+
+    auto database = std::make_unique<MaxMindDbReader>();
+    if (!database->open(config_.database_path)) return false;
+
+    std::lock_guard lock(mutex_);
+    database_ = std::move(database);
+    LOG_INFO("GeoIP: loaded database " + config_.database_path);
+    return true;
 }
 
 // === Unified Anti-Bot Engine ===
@@ -549,7 +636,11 @@ AntiBotEngine::AntiBotEngine(Config config)
     , js_challenge_(config_.js_challenge)
     , pow_challenge_(config_.pow)
     , tarpit_(config_.tarpit)
-    , geoip_(config_.geoip) {}
+    , geoip_(config_.geoip) {
+    if (config_.geoip_enabled && !geoip_.load_database()) {
+        LOG_ERROR("GeoIP: filtering is enabled but the database could not be loaded");
+    }
+}
 
 AntiBotEngine::Verdict AntiBotEngine::inspect(const HttpRequest& req,
                                                 const std::string& client_ip,

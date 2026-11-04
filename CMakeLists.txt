@@ -19,6 +19,15 @@ endif()
 # Strict warnings
 add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wno-error=unused-parameter)
 
+# ===== Sanitizer build =====
+# Must be declared before any target so the flags apply to every target.
+option(SANITIZE "Enable AddressSanitizer + UBSan" OFF)
+if(SANITIZE)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+    message(STATUS "AddressSanitizer + UBSan enabled")
+endif()
+
 # Use mold or lld linker if available
 find_program(MOLD_LINKER "mold")
 find_program(LLD_LINKER "ld.lld")
@@ -30,8 +39,20 @@ elseif(LLD_LINKER)
     message(STATUS "Using lld linker")
 endif()
 
+find_package(Threads REQUIRED)
+
 # Find OpenSSL
 find_package(OpenSSL REQUIRED)
+
+# Find zlib (gzip compression, gRPC message compression)
+find_package(ZLIB REQUIRED)
+
+# Find MaxMind DB (GeoIP)
+find_library(MAXMINDDB_LIBRARY NAMES maxminddb)
+find_path(MAXMINDDB_INCLUDE_DIR NAMES maxminddb.h)
+if(NOT MAXMINDDB_LIBRARY OR NOT MAXMINDDB_INCLUDE_DIR)
+    message(FATAL_ERROR "libmaxminddb not found. Install libmaxminddb-dev.")
+endif()
 
 # Find RE2
 find_package(PkgConfig QUIET)
@@ -93,8 +114,33 @@ if(NGTCP2_LIBRARIES AND NGTCP2_INCLUDE_DIRS)
     set(NGTCP2_FOUND TRUE)
     message(STATUS "ngtcp2 found: ${NGTCP2_LIBRARIES}")
 else()
-    message(FATAL_ERROR "ngtcp2 not found. Build from https://github.com/ngtcp2/ngtcp2")
+    message(FATAL_ERROR "ngtcp2 not found. Install libngtcp2-dev or build from https://github.com/ngtcp2/ngtcp2")
 endif()
+
+# Find ngtcp2 crypto backend (GnuTLS) -- provides the QUIC TLS 1.3 handshake
+find_library(NGTCP2_CRYPTO_LIBRARIES NAMES ngtcp2_crypto_gnutls HINTS /usr/local/lib64 /usr/local/lib)
+find_path(NGTCP2_CRYPTO_INCLUDE_DIRS NAMES ngtcp2/ngtcp2_crypto_gnutls.h HINTS /usr/local/include)
+if(NGTCP2_CRYPTO_LIBRARIES AND NGTCP2_CRYPTO_INCLUDE_DIRS)
+    message(STATUS "ngtcp2_crypto_gnutls found: ${NGTCP2_CRYPTO_LIBRARIES}")
+else()
+    message(FATAL_ERROR "ngtcp2_crypto_gnutls not found. Install libngtcp2-crypto-gnutls-dev "
+                        "or build ngtcp2 with -DENABLE_GNUTLS=ON")
+endif()
+
+# Find GnuTLS (used only by the QUIC transport)
+if(PkgConfig_FOUND)
+    pkg_check_modules(GNUTLS QUIET gnutls)
+endif()
+if(NOT GNUTLS_FOUND)
+    find_library(GNUTLS_LIBRARIES NAMES gnutls)
+    find_path(GNUTLS_INCLUDE_DIRS NAMES gnutls/gnutls.h)
+    if(GNUTLS_LIBRARIES AND GNUTLS_INCLUDE_DIRS)
+        set(GNUTLS_FOUND TRUE)
+    else()
+        message(FATAL_ERROR "GnuTLS not found. Install gnutls-devel / libgnutls28-dev.")
+    endif()
+endif()
+message(STATUS "GnuTLS found: ${GNUTLS_LIBRARIES}")
 
 # Find nghttp3 (HTTP/3)
 find_library(NGHTTP3_LIBRARIES NAMES nghttp3 HINTS /usr/local/lib64 /usr/local/lib)
@@ -103,13 +149,13 @@ if(NGHTTP3_LIBRARIES AND NGHTTP3_INCLUDE_DIRS)
     set(NGHTTP3_FOUND TRUE)
     message(STATUS "nghttp3 found: ${NGHTTP3_LIBRARIES}")
 else()
-    message(FATAL_ERROR "nghttp3 not found. Build from https://github.com/ngtcp2/nghttp3")
+    message(FATAL_ERROR "nghttp3 not found. Install libnghttp3-dev or build from https://github.com/ngtcp2/nghttp3")
 endif()
 
-# Source files
-set(JS_SOURCES
+# Source files (everything except main.cpp goes into the core library,
+# which is shared by the server binary and the unit tests)
+set(JS_CORE_SOURCES
     # Original sources
-    src/main.cpp
     src/server.cpp
     src/worker.cpp
     src/tls_context.cpp
@@ -132,6 +178,7 @@ set(JS_SOURCES
 
     # Stage 2: Transport & Crypto
     src/compression.cpp
+    src/http_client.cpp
     src/acme_client.cpp
 
     # Stage 3: Gateway & Balancer
@@ -145,38 +192,50 @@ set(JS_SOURCES
 
     # Stage 5: Anti-Bot
     src/anti_bot.cpp
+    src/mmdb_reader.cpp
 
     # HTTP/3 & QUIC
     src/http3.cpp
 
     # Stage 6: WASM Plugins
+    src/wasm_interpreter.cpp
     src/wasm_plugin.cpp
 )
 
-add_executable(justserver ${JS_SOURCES})
-
-target_include_directories(justserver PRIVATE
+set(JS_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
     ${OPENSSL_INCLUDE_DIR}
+    ${MAXMINDDB_INCLUDE_DIR}
     ${RE2_INCLUDE_DIRS}
     ${URING_INCLUDE_DIRS}
     ${BROTLI_INCLUDE_DIRS}
     ${ZSTD_INCLUDE_DIRS}
     ${NGTCP2_INCLUDE_DIRS}
+    ${NGTCP2_CRYPTO_INCLUDE_DIRS}
     ${NGHTTP3_INCLUDE_DIRS}
+    ${GNUTLS_INCLUDE_DIRS}
 )
 
-target_link_libraries(justserver PRIVATE
+add_library(justserver_core STATIC ${JS_CORE_SOURCES})
+target_include_directories(justserver_core PUBLIC ${JS_INCLUDE_DIRS})
+target_link_libraries(justserver_core PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
+    ZLIB::ZLIB
+    ${MAXMINDDB_LIBRARY}
     ${RE2_LIBRARIES}
     ${URING_LIBRARIES}
     ${BROTLI_LIBRARIES}
     ${ZSTD_LIBRARIES}
+    ${NGTCP2_CRYPTO_LIBRARIES}
     ${NGTCP2_LIBRARIES}
     ${NGHTTP3_LIBRARIES}
-    pthread
+    ${GNUTLS_LIBRARIES}
+    Threads::Threads
 )
+
+add_executable(justserver src/main.cpp)
+target_link_libraries(justserver PRIVATE justserver_core)
 
 # Install target
 install(TARGETS justserver DESTINATION bin)
@@ -203,46 +262,23 @@ if(BUILD_TESTS)
         tests/test_jwt.cpp
         tests/test_anti_bot.cpp
         tests/test_tracing.cpp
-        # Source files needed by tests
-        src/http_parser.cpp
-        src/waf.cpp
-        src/http2.cpp
-        src/unicode.cpp
-        src/websocket.cpp
-        src/grpc_handler.cpp
-        src/logger.cpp
-        src/config.cpp
-        src/metrics.cpp
-        src/compression.cpp
-        src/cache.cpp
-        src/load_balancer.cpp
-        src/jwt_validator.cpp
-        src/anti_bot.cpp
-        src/tracing.cpp
-        src/stream.cpp
-        src/wasm_plugin.cpp
+        tests/test_geoip.cpp
+        tests/test_http_client.cpp
+        tests/test_tls.cpp
+        tests/test_config.cpp
+        tests/test_proxy.cpp
+        tests/test_wasm.cpp
+        tests/test_acme.cpp
+        tests/test_http3.cpp
+        tests/test_stream.cpp
     )
 
     # Tests use assert() which is no-op in Release, causing unused variable warnings
     target_compile_options(justserver_tests PRIVATE -Wno-unused-variable -Wno-unused-but-set-variable)
+    # Keep assert() active in every build type so the test suites really check something
+    target_compile_options(justserver_tests PRIVATE -UNDEBUG)
 
-    target_include_directories(justserver_tests PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${OPENSSL_INCLUDE_DIR}
-        ${RE2_INCLUDE_DIRS}
-        ${URING_INCLUDE_DIRS}
-        ${BROTLI_INCLUDE_DIRS}
-        ${ZSTD_INCLUDE_DIRS}
-    )
-
-    target_link_libraries(justserver_tests PRIVATE
-        OpenSSL::SSL
-        OpenSSL::Crypto
-        ${RE2_LIBRARIES}
-        ${BROTLI_LIBRARIES}
-        ${ZSTD_LIBRARIES}
-        pthread
-    )
+    target_link_libraries(justserver_tests PRIVATE justserver_core)
 
     add_test(NAME unit_tests COMMAND justserver_tests)
 endif()
@@ -259,7 +295,7 @@ if(BUILD_FUZZ)
         src/logger.cpp
     )
     target_include_directories(fuzz_http_parser PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR} ${RE2_INCLUDE_DIRS})
-    target_link_libraries(fuzz_http_parser PRIVATE ${RE2_LIBRARIES} pthread)
+    target_link_libraries(fuzz_http_parser PRIVATE ${RE2_LIBRARIES} Threads::Threads)
 
     add_executable(fuzz_http2
         fuzz/fuzz_http2.cpp
@@ -269,7 +305,7 @@ if(BUILD_FUZZ)
         src/metrics.cpp
     )
     target_include_directories(fuzz_http2 PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR} ${RE2_INCLUDE_DIRS})
-    target_link_libraries(fuzz_http2 PRIVATE OpenSSL::SSL OpenSSL::Crypto ${RE2_LIBRARIES} pthread)
+    target_link_libraries(fuzz_http2 PRIVATE OpenSSL::SSL OpenSSL::Crypto ${RE2_LIBRARIES} Threads::Threads)
 
     add_executable(fuzz_waf
         fuzz/fuzz_waf.cpp
@@ -279,7 +315,7 @@ if(BUILD_FUZZ)
         src/logger.cpp
     )
     target_include_directories(fuzz_waf PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR} ${RE2_INCLUDE_DIRS})
-    target_link_libraries(fuzz_waf PRIVATE ${RE2_LIBRARIES} pthread)
+    target_link_libraries(fuzz_waf PRIVATE ${RE2_LIBRARIES} Threads::Threads)
 
     # JWT validator fuzzer -- tests the state-machine JSON parser
     add_executable(fuzz_jwt
@@ -288,7 +324,7 @@ if(BUILD_FUZZ)
         src/logger.cpp
     )
     target_include_directories(fuzz_jwt PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(fuzz_jwt PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread)
+    target_link_libraries(fuzz_jwt PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 
     # FastCGI protocol fuzzer -- tests response parsing robustness
     add_executable(fuzz_fastcgi
@@ -298,7 +334,7 @@ if(BUILD_FUZZ)
         src/logger.cpp
     )
     target_include_directories(fuzz_fastcgi PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR} ${RE2_INCLUDE_DIRS})
-    target_link_libraries(fuzz_fastcgi PRIVATE ${RE2_LIBRARIES} pthread)
+    target_link_libraries(fuzz_fastcgi PRIVATE ${RE2_LIBRARIES} Threads::Threads)
 
     # HTTP/3 QUIC fuzzer -- tests QUIC frame/stream parsing
     add_executable(fuzz_http3
@@ -311,19 +347,22 @@ if(BUILD_FUZZ)
     )
     target_include_directories(fuzz_http3 PRIVATE
         ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR} ${RE2_INCLUDE_DIRS}
-        ${NGTCP2_INCLUDE_DIRS} ${NGHTTP3_INCLUDE_DIRS}
+        ${NGTCP2_INCLUDE_DIRS} ${NGTCP2_CRYPTO_INCLUDE_DIRS} ${NGHTTP3_INCLUDE_DIRS} ${GNUTLS_INCLUDE_DIRS}
     )
     target_link_libraries(fuzz_http3 PRIVATE
         OpenSSL::SSL OpenSSL::Crypto
-        ${NGTCP2_LIBRARIES} ${NGHTTP3_LIBRARIES}
-        ${RE2_LIBRARIES} pthread
+        ${NGTCP2_CRYPTO_LIBRARIES} ${NGTCP2_LIBRARIES} ${NGHTTP3_LIBRARIES} ${GNUTLS_LIBRARIES}
+        ${RE2_LIBRARIES} Threads::Threads
     )
-endif()
 
-# ===== Sanitizer build =====
-option(SANITIZE "Enable AddressSanitizer + UBSan" OFF)
-if(SANITIZE)
-    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
-    add_link_options(-fsanitize=address,undefined)
-    message(STATUS "AddressSanitizer + UBSan enabled")
+    # WASM interpreter fuzzer -- tests the module decoder/validator and the sandbox
+    add_executable(fuzz_wasm
+        fuzz/fuzz_wasm.cpp
+        src/wasm_interpreter.cpp
+        src/wasm_plugin.cpp
+        src/http_parser.cpp
+        src/logger.cpp
+    )
+    target_include_directories(fuzz_wasm PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR})
+    target_link_libraries(fuzz_wasm PRIVATE Threads::Threads)
 endif()

@@ -15,11 +15,15 @@
 #include <mutex>
 #include <array>
 #include <span>
+#include <sys/socket.h>
 
 // Forward declarations for ngtcp2/nghttp3 types
 struct ngtcp2_conn;
 struct nghttp3_conn;
 struct nghttp3_rcbuf;
+struct ngtcp2_crypto_conn_ref;
+typedef struct gnutls_certificate_credentials_st* gnutls_certificate_credentials_t;
+typedef struct gnutls_session_int* gnutls_session_t;
 
 namespace js {
 
@@ -48,15 +52,18 @@ struct QuicTransportParams {
     uint64_t initial_max_streams_bidi = 100;
     uint64_t initial_max_streams_uni = 3;
     uint64_t max_udp_payload_size = 1350;
+    size_t max_request_size_bytes = 8 * 1024 * 1024;
     bool disable_active_migration = true;
 };
 
 // A single QUIC connection handling HTTP/3
 class Http3Connection {
 public:
-    using RequestHandler = std::function<HttpResponse(const HttpRequest&)>;
+    using RequestHandler =
+        std::function<HttpResponse(const HttpRequest&, const std::string&)>;
 
-    Http3Connection(RequestHandler handler, const QuicTransportParams& params);
+    Http3Connection(RequestHandler handler, const QuicTransportParams& params,
+                    std::string client_ip);
     ~Http3Connection();
 
     // Non-copyable
@@ -66,13 +73,18 @@ public:
     // Process incoming UDP data, returns UDP packets to send back
     struct OutgoingPacket {
         std::vector<uint8_t> data;
-        // Destination address info would go here for real routing
+        sockaddr_storage destination{};
+        socklen_t address_length = 0;
     };
     std::vector<OutgoingPacket> process_input(std::span<const uint8_t> data,
-                                                const std::string& peer_addr);
+                                               const sockaddr* local_addr,
+                                               socklen_t local_addr_len,
+                                               const sockaddr* remote_addr,
+                                               socklen_t remote_addr_len);
 
     // Periodic timer: call to handle retransmission, idle timeout, etc.
     std::vector<OutgoingPacket> on_timer();
+    int set_credentials(gnutls_certificate_credentials_t credentials);
 
     // Get the next timeout (when on_timer should be called)
     std::chrono::milliseconds next_timeout() const;
@@ -84,6 +96,7 @@ public:
     // Get connection IDs
     QuicConnectionId source_cid() const { return scid_; }
     QuicConnectionId dest_cid() const { return dcid_; }
+    std::vector<QuicConnectionId> source_connection_ids() const;
 
     // Stats
     uint64_t bytes_sent() const { return bytes_sent_; }
@@ -91,6 +104,8 @@ public:
     uint64_t streams_opened() const { return streams_opened_; }
 
 private:
+    friend class QuicDispatcher;
+
     // ngtcp2 callbacks
     static int on_recv_stream_data(ngtcp2_conn* conn, uint32_t flags,
                                     int64_t stream_id, uint64_t offset,
@@ -120,24 +135,45 @@ private:
     // Internal helpers
     std::vector<OutgoingPacket> write_packets();
     void send_response(int64_t stream_id, const HttpResponse& resp);
+    int initialize(const QuicConnectionId& original_dcid,
+                   const QuicConnectionId& client_scid, uint32_t version,
+                   const sockaddr* local_addr, socklen_t local_addr_len,
+                   const sockaddr* remote_addr, socklen_t remote_addr_len,
+                   gnutls_certificate_credentials_t credentials);
+    static int on_handshake_completed(ngtcp2_conn* conn, void* user_data);
+    static ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* conn_ref);
 
     // Per-stream request accumulation
     struct StreamContext {
         HttpRequest request;
         bool headers_complete = false;
         bool data_complete = false;
+        bool response_submitted = false;
+    };
+
+    struct ResponseBody {
+        std::string data;
+        size_t offset = 0;
     };
 
     RequestHandler handler_;
     QuicTransportParams params_;
+    std::string client_ip_;
 
     ngtcp2_conn* quic_conn_ = nullptr;
     nghttp3_conn* h3_conn_ = nullptr;
+    gnutls_session_t tls_session_ = nullptr;
+    std::unique_ptr<ngtcp2_crypto_conn_ref> conn_ref_;
 
     QuicConnectionId scid_;
     QuicConnectionId dcid_;
+    sockaddr_storage local_address_{};
+    sockaddr_storage remote_address_{};
+    socklen_t local_address_len_ = 0;
+    socklen_t remote_address_len_ = 0;
 
     std::unordered_map<int64_t, StreamContext> streams_;
+    std::unordered_map<int64_t, std::unique_ptr<ResponseBody>> response_bodies_;
     bool alive_ = true;
     bool handshake_complete_ = false;
 
@@ -151,6 +187,13 @@ private:
 // by Connection ID. This is the main entry point for HTTP/3.
 class QuicDispatcher {
 public:
+    struct DecodedPacket {
+        QuicConnectionId dcid;
+        QuicConnectionId scid;
+        uint32_t version = 0;
+        bool initial = false;
+    };
+
     struct Config {
         uint16_t port = 443;
         std::string bind_address = "0.0.0.0";
@@ -169,6 +212,9 @@ public:
 
     // Initialize the UDP socket
     bool init();
+    static std::optional<DecodedPacket> decode_packet(
+        std::span<const uint8_t> data, size_t short_dcid_length = 16);
+    bool reload_tls_credentials();
 
     // Process one batch of incoming UDP packets
     // Returns number of packets processed
@@ -181,6 +227,7 @@ public:
     void tick();
 
     // Stats
+    int socket_fd() const { return udp_fd_; }
     size_t active_connections() const;
     uint64_t total_packets_received() const { return total_packets_rx_; }
     uint64_t total_packets_sent() const { return total_packets_tx_; }
@@ -192,10 +239,16 @@ private:
     // Create a new connection for an Initial packet
     Http3Connection* create_connection(const QuicConnectionId& scid,
                                          const QuicConnectionId& dcid,
+                                         uint32_t version,
+                                         const sockaddr* local_addr,
+                                         socklen_t local_addr_len,
+                                         const sockaddr* remote_addr,
+                                         socklen_t remote_addr_len,
                                          const std::string& peer_addr);
 
     // Remove a dead connection
     void remove_connection(const QuicConnectionId& cid);
+    void register_connection_ids(Http3Connection* conn);
 
     // Clean up idle connections
     void cleanup_idle();
@@ -204,10 +257,13 @@ private:
     Http3Connection::RequestHandler handler_;
 
     int udp_fd_ = -1;
+    gnutls_certificate_credentials_t tls_credentials_ = nullptr;
 
     // Connection map: CID -> connection
     std::unordered_map<QuicConnectionId, std::unique_ptr<Http3Connection>,
                        QuicConnectionIdHash> connections_;
+    std::unordered_map<QuicConnectionId, Http3Connection*,
+                       QuicConnectionIdHash> cid_routes_;
     mutable std::mutex connections_mutex_;
 
     // Stats

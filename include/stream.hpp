@@ -7,6 +7,7 @@
 #include <string_view>
 #include <functional>
 #include <memory>
+#include <sys/types.h>
 
 namespace js {
 
@@ -148,11 +149,17 @@ private:
     bool open_ = true;
 };
 
-// QUIC stream (placeholder for HTTP/3 transport)
+// Buffered QUIC stream adapter. The HTTP/3 transport feeds received data and
+// supplies a writer that queues data on the corresponding ngtcp2 stream.
 class QuicStream : public IStream {
 public:
-    QuicStream(uint64_t stream_id, void* quic_conn)
-        : stream_id_(stream_id), quic_conn_(quic_conn) {}
+    using WriteFn = std::function<bool(uint64_t stream_id, const void* data, size_t len)>;
+    using ShutdownFn = std::function<void(uint64_t stream_id)>;
+
+    explicit QuicStream(uint64_t stream_id, WriteFn write_fn = {},
+                        ShutdownFn shutdown_fn = {}, size_t max_buffer_bytes = 1024 * 1024)
+        : stream_id_(stream_id), write_fn_(std::move(write_fn)),
+          shutdown_fn_(std::move(shutdown_fn)), max_buffer_bytes_(max_buffer_bytes) {}
 
     ssize_t read(void* buf, size_t max_bytes) override;
     ssize_t write(const void* buf, size_t len) override;
@@ -162,10 +169,18 @@ public:
     std::string_view stream_type() const override { return "quic"; }
 
     uint64_t quic_stream_id() const { return stream_id_; }
+    bool feed_data(std::span<const uint8_t> data);
+    void finish_read();
 
 private:
     uint64_t stream_id_;
-    void* quic_conn_;
+    WriteFn write_fn_;
+    ShutdownFn shutdown_fn_;
+    std::string read_buffer_;
+    size_t read_offset_ = 0;
+    size_t max_buffer_bytes_;
+    bool read_finished_ = false;
+    bool write_shutdown_ = false;
     bool open_ = true;
 };
 

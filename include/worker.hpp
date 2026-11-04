@@ -11,6 +11,8 @@
 #include "file_handler.hpp"
 #include "fastcgi_client.hpp"
 #include "metrics.hpp"
+#include "anti_bot.hpp"
+#include "wasm_plugin.hpp"
 
 #include <functional>
 #include <string>
@@ -21,10 +23,12 @@ namespace js {
 class Worker {
 public:
     Worker(const Config& config, TLSContext* tls, WAF* waf,
-           DDoSGuard* ddos, FileHandler* file_handler, FastCGIClient* fcgi);
+           DDoSGuard* ddos, FileHandler* file_handler, FastCGIClient* fcgi,
+           GeoIPFilter* geoip_filter = nullptr, PluginManager* plugin_manager = nullptr);
 
     // Handle an accepted connection
     void handle_connection(int client_fd, const std::string& client_ip);
+    HttpResponse handle_http3_request(const HttpRequest& req, const std::string& client_ip);
 
 private:
     // Read full request with timeout
@@ -40,6 +44,8 @@ private:
 
     // Route request to appropriate handler
     HttpResponse route_request(const HttpRequest& req, const std::string& client_ip = "");
+    HttpResponse process_request(const HttpRequest& req, const std::string& client_ip,
+                                 GrpcHandler& grpc);
 
     // Apply security headers to response
     void apply_security_headers(HttpResponse& resp) const;
@@ -60,6 +66,8 @@ private:
     DDoSGuard* ddos_;
     FileHandler* file_handler_;
     FastCGIClient* fcgi_;
+    GeoIPFilter* geoip_filter_;
+    PluginManager* plugin_manager_;
 };
 
 } // namespace js

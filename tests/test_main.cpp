@@ -44,6 +44,14 @@ extern void run_load_balancer_tests();
 extern void run_jwt_tests();
 extern void run_anti_bot_tests();
 extern void run_tracing_tests();
+extern void run_geoip_tests();
+extern void run_config_tests();
+extern void run_wasm_tests();
+extern void run_http_client_tests();
+extern void run_acme_tests();
+extern void run_tls_tests();
+extern void run_http3_tests();
+extern void run_stream_tests();
 
 int main() {
     int passed = 0;
@@ -78,6 +86,14 @@ int main() {
     try { run_jwt_tests(); } catch (const std::exception& e) { std::cerr << "JWT tests EXCEPTION: " << e.what() << "\n"; failed++; }
     try { run_anti_bot_tests(); } catch (const std::exception& e) { std::cerr << "Anti-bot tests EXCEPTION: " << e.what() << "\n"; failed++; }
     try { run_tracing_tests(); } catch (const std::exception& e) { std::cerr << "Tracing tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_geoip_tests(); } catch (const std::exception& e) { std::cerr << "GeoIP tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_config_tests(); } catch (const std::exception& e) { std::cerr << "Config tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_wasm_tests(); } catch (const std::exception& e) { std::cerr << "WASM tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_http_client_tests(); } catch (const std::exception& e) { std::cerr << "HTTP client tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_acme_tests(); } catch (const std::exception& e) { std::cerr << "ACME tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_tls_tests(); } catch (const std::exception& e) { std::cerr << "TLS tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_http3_tests(); } catch (const std::exception& e) { std::cerr << "HTTP/3 tests EXCEPTION: " << e.what() << "\n"; failed++; }
+    try { run_stream_tests(); } catch (const std::exception& e) { std::cerr << "Stream tests EXCEPTION: " << e.what() << "\n"; failed++; }
 
     return failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -13,6 +13,21 @@ static std::string trim(std::string_view sv) {
     return std::string(sv.substr(start, end - start + 1));
 }
 
+static std::vector<std::string> split_list(std::string_view value) {
+    std::vector<std::string> items;
+    size_t pos = 0;
+    while (pos <= value.size()) {
+        auto comma = value.find(',', pos);
+        auto item = trim(value.substr(pos, comma == std::string_view::npos
+                                              ? std::string_view::npos
+                                              : comma - pos));
+        if (!item.empty()) items.push_back(std::move(item));
+        if (comma == std::string_view::npos) break;
+        pos = comma + 1;
+    }
+    return items;
+}
+
 Config Config::defaults() {
     return Config{};
 }
@@ -45,6 +60,14 @@ Config Config::load_from_file(const std::string& path) {
         else if (key == "tls_cert") config.tls_cert_path = value;
         else if (key == "tls_key") config.tls_key_path = value;
         else if (key == "tls_enabled") config.tls_enabled = (value == "true" || value == "1");
+        else if (key == "http3_enabled") config.http3_enabled = (value == "true" || value == "1");
+        else if (key == "http3_port") config.http3_port = static_cast<uint16_t>(std::stoi(value));
+        else if (key == "acme_enabled") config.acme_enabled = (value == "true" || value == "1");
+        else if (key == "acme_email") config.acme_email = value;
+        else if (key == "acme_domains") config.acme_domains = split_list(value);
+        else if (key == "acme_storage") config.acme_storage_path = value;
+        else if (key == "acme_use_staging") config.acme_use_staging = (value == "true" || value == "1");
+        else if (key == "acme_directory_url") config.acme_directory_url = value;
         else if (key == "max_connections_per_ip") config.max_connections_per_ip = std::stoi(value);
         else if (key == "header_read_timeout_ms") config.header_read_timeout_ms = std::stoi(value);
         else if (key == "request_body_timeout_ms") config.request_body_timeout_ms = std::stoi(value);
@@ -56,6 +79,14 @@ Config Config::load_from_file(const std::string& path) {
         else if (key == "fastcgi_enabled") config.fastcgi_enabled = (value == "true" || value == "1");
         else if (key == "waf_enabled") config.waf_enabled = (value == "true" || value == "1");
         else if (key == "waf_body_inspection_limit") config.waf_body_inspection_limit = static_cast<size_t>(std::stoi(value));
+        else if (key == "antibot_geoip_enabled") config.geoip_enabled = (value == "true" || value == "1");
+        else if (key == "antibot_geoip_database") config.geoip_database_path = value;
+        else if (key == "antibot_blocked_countries") config.geoip_blocked_countries = split_list(value);
+        else if (key == "wasm_enabled") config.wasm_enabled = (value == "true" || value == "1");
+        else if (key == "wasm_plugin_dir") config.wasm_plugin_dir = value;
+        else if (key == "wasm_max_memory_mb")
+            config.wasm_max_memory_bytes = static_cast<size_t>(std::stoull(value)) * 1024 * 1024;
+        else if (key == "wasm_timeout_ms") config.wasm_execution_timeout_ms = std::stoi(value);
         else if (key == "log_level") config.log_level = value;
         // Rate limiting
         else if (key == "rate_limit_rps") config.rate_limit_rps = std::stod(value);

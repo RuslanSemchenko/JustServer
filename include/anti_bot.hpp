@@ -1,11 +1,13 @@
 #pragma once
 
 #include "http_parser.hpp"
+#include "mmdb_reader.hpp"
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <memory>
 #include <atomic>
 #include <chrono>
 #include <optional>
@@ -15,8 +17,11 @@
 
 // Forward declare SSL types
 struct ssl_st;
+struct ssl_ctx_st;
 
 namespace js {
+
+void install_ja3_client_hello_capture(ssl_ctx_st* context);
 
 // === JA3/JA4 TLS Fingerprinting ===
 // Passive fingerprinting of TLS ClientHello to detect bots.
@@ -223,14 +228,7 @@ public:
 
 private:
     Config config_;
-    // In-memory IP range -> country code mapping
-    // Simplified structure (full implementation would use a radix trie)
-    struct IpRange {
-        uint32_t start;
-        uint32_t end;
-        std::string country;
-    };
-    std::vector<IpRange> ranges_;
+    std::unique_ptr<MaxMindDbReader> database_;
     mutable std::mutex mutex_;
 };
 

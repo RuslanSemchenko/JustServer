@@ -95,6 +95,9 @@ public:
 
     // Get module info
     virtual PluginInfo get_info() const = 0;
+
+    // Error from the last load or invocation, if any.
+    virtual std::string last_error() const { return {}; }
 };
 
 // Plugin manager: loads, manages, and executes WASM plugins
@@ -141,6 +144,7 @@ private:
     struct LoadedPlugin {
         PluginInfo info;
         std::unique_ptr<WasmRuntime> runtime;
+        std::unique_ptr<std::mutex> runtime_mutex = std::make_unique<std::mutex>();
         std::string path;
     };
 
@@ -150,19 +154,6 @@ private:
     // Key-value store shared across plugins
     std::unordered_map<std::string, std::string> kv_store_;
     mutable std::mutex kv_mutex_;
-};
-
-// Stub WASM runtime (used when no WASM engine is available)
-// Returns sensible defaults and logs that WASM is not available.
-class StubWasmRuntime : public WasmRuntime {
-public:
-    bool load_module(const std::string& path) override;
-    bool load_module_bytes(const uint8_t* data, size_t len) override;
-    std::optional<int32_t> call_function(const std::string& name) override;
-    void set_host_functions(const PluginHostFunctions& funcs) override;
-    bool write_memory(uint32_t offset, const void* data, size_t len) override;
-    bool read_memory(uint32_t offset, void* data, size_t len) override;
-    PluginInfo get_info() const override;
 };
 
 } // namespace js

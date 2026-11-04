@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <filesystem>
+#include <vector>
 
 namespace js {
 
@@ -45,6 +46,16 @@ struct Config {
     std::string tls_cert_path = "/etc/justserver/cert.pem";
     std::string tls_key_path = "/etc/justserver/key.pem";
     bool tls_enabled = true;
+    bool http3_enabled = false;
+    uint16_t http3_port = 0;
+
+    // Automatic certificate management (HTTP-01 requires inbound TCP port 80)
+    bool acme_enabled = false;
+    std::string acme_email;
+    std::vector<std::string> acme_domains;
+    std::string acme_storage_path = "/etc/justserver/acme";
+    bool acme_use_staging = false;
+    std::string acme_directory_url = "https://acme-v02.api.letsencrypt.org/directory";
 
     // DDoS protection
     int max_connections_per_ip = 50;
@@ -83,6 +94,17 @@ struct Config {
     // WAF
     bool waf_enabled = true;
     size_t waf_body_inspection_limit = 131072; // 128 KB max body inspection
+
+    // GeoIP country filtering
+    bool geoip_enabled = false;
+    std::string geoip_database_path;
+    std::vector<std::string> geoip_blocked_countries;
+
+    // WebAssembly plugins
+    bool wasm_enabled = false;
+    std::string wasm_plugin_dir = "/etc/justserver/plugins";
+    size_t wasm_max_memory_bytes = 64 * 1024 * 1024;
+    int wasm_execution_timeout_ms = 100;
 
     // Security headers
     SecurityHeadersConfig security_headers;

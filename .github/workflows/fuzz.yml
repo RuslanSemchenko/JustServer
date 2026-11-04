@@ -1,0 +1,84 @@
+name: Fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Fuzzer target to run
+        required: true
+        type: choice
+        options:
+          - all
+          - http_parser
+          - http2
+          - waf
+          - jwt
+          - fastcgi
+          - http3
+          - wasm
+        default: all
+      seconds:
+        description: Fuzzing time per target in seconds
+        required: true
+        type: number
+        default: 60
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Build and run libFuzzer targets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-dependencies
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-fuzz
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_BUILD_TYPE=Debug
+          -DBUILD_TESTS=OFF
+          -DBUILD_FUZZ=ON
+
+      - name: Build fuzzers
+        run: cmake --build build-fuzz --parallel "$(nproc)"
+
+      - name: Run selected fuzzers
+        env:
+          FUZZ_TARGET: ${{ inputs.target }}
+          FUZZ_SECONDS: ${{ inputs.seconds }}
+        shell: bash
+        run: |
+          if ! [[ "$FUZZ_SECONDS" =~ ^[0-9]+$ ]] ||
+             (( FUZZ_SECONDS < 1 || FUZZ_SECONDS > 3600 )); then
+            echo "Fuzzing seconds must be an integer from 1 to 3600" >&2
+            exit 1
+          fi
+
+          case "$FUZZ_TARGET" in
+            all) targets=(http_parser http2 waf jwt fastcgi http3 wasm) ;;
+            http_parser|http2|waf|jwt|fastcgi|http3|wasm)
+              targets=("$FUZZ_TARGET")
+              ;;
+            *)
+              echo "Unknown fuzzer target: $FUZZ_TARGET" >&2
+              exit 1
+              ;;
+          esac
+
+          for target in "${targets[@]}"; do
+            max_len=16384
+            if [[ "$target" == "http_parser" || "$target" == "waf" ]]; then
+              max_len=8192
+            elif [[ "$target" == "fastcgi" || "$target" == "http3" ]]; then
+              max_len=65536
+            fi
+            echo "Running fuzz_${target} for ${FUZZ_SECONDS}s"
+            timeout --signal=INT "$((FUZZ_SECONDS + 30))" \
+              "./build-fuzz/fuzz_${target}" \
+              "-max_total_time=${FUZZ_SECONDS}" \
+              "-max_len=${max_len}" \
+              -print_final_stats=1
+          done

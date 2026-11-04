@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <optional>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace js {
 
@@ -38,6 +40,9 @@ struct HttpResponse {
     std::string status_text = "OK";
     std::unordered_map<std::string, std::string> headers;
     std::string body;
+
+    // Trailing header fields sent after the body (HTTP/2 and HTTP/3 only, e.g. grpc-status)
+    std::vector<std::pair<std::string, std::string>> trailers;
 
     std::string serialize() const;
 

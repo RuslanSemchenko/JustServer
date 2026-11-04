@@ -3,6 +3,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>
+#include <algorithm>
+#include <limits>
 
 // OpenSSL functions for TlsStream -- we use the real SSL type via cast
 #include <openssl/ssl.h>
@@ -109,25 +112,87 @@ void H2VirtualStream::feed_data(std::span<const uint8_t> data) {
     read_buffer_.append(reinterpret_cast<const char*>(data.data()), data.size());
 }
 
-// === QuicStream (stub -- real implementation requires ngtcp2/nghttp3) ===
+// === QuicStream ===
 
-ssize_t QuicStream::read([[maybe_unused]] void* buf, [[maybe_unused]] size_t max_bytes) {
-    // TODO: Implement with ngtcp2 when QUIC transport is integrated
-    return -1;
+ssize_t QuicStream::read(void* buf, size_t max_bytes) {
+    if (!open_) {
+        errno = EBADF;
+        return -1;
+    }
+    if (!buf && max_bytes > 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (max_bytes == 0) return 0;
+    if (read_offset_ == read_buffer_.size()) {
+        read_buffer_.clear();
+        read_offset_ = 0;
+        if (read_finished_) return 0;
+        errno = EAGAIN;
+        return -1;
+    }
+    size_t count = std::min(max_bytes, read_buffer_.size() - read_offset_);
+    std::memcpy(buf, read_buffer_.data() + read_offset_, count);
+    read_offset_ += count;
+    if (read_offset_ == read_buffer_.size()) {
+        read_buffer_.clear();
+        read_offset_ = 0;
+    }
+    return static_cast<ssize_t>(count);
 }
 
-ssize_t QuicStream::write([[maybe_unused]] const void* buf, [[maybe_unused]] size_t len) {
-    // TODO: Implement with ngtcp2
-    return -1;
+ssize_t QuicStream::write(const void* buf, size_t len) {
+    if (!open_ || write_shutdown_ || !write_fn_) {
+        errno = EPIPE;
+        return -1;
+    }
+    if (len == 0) return 0;
+    if (!buf || len > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!write_fn_(stream_id_, buf, len)) {
+        if (errno == 0) errno = EAGAIN;
+        return -1;
+    }
+    return static_cast<ssize_t>(len);
 }
 
 void QuicStream::shutdown() {
-    open_ = false;
+    if (write_shutdown_) return;
+    write_shutdown_ = true;
+    if (shutdown_fn_) shutdown_fn_(stream_id_);
+    if (read_finished_) open_ = false;
 }
 
 void QuicStream::close() {
+    shutdown();
     open_ = false;
-    quic_conn_ = nullptr;
+    read_finished_ = true;
+    write_shutdown_ = true;
+    read_buffer_.clear();
+    read_offset_ = 0;
+}
+
+bool QuicStream::feed_data(std::span<const uint8_t> data) {
+    if (!open_ || read_finished_) return false;
+    if (data.empty()) return true;
+    size_t buffered = read_buffer_.size() - read_offset_;
+    if (data.size() > max_buffer_bytes_ - std::min(max_buffer_bytes_, buffered)) {
+        errno = ENOBUFS;
+        return false;
+    }
+    if (read_offset_ > 0) {
+        read_buffer_.erase(0, read_offset_);
+        read_offset_ = 0;
+    }
+    read_buffer_.append(reinterpret_cast<const char*>(data.data()), data.size());
+    return true;
+}
+
+void QuicStream::finish_read() {
+    read_finished_ = true;
+    if (write_shutdown_) open_ = false;
 }
 
 } // namespace js

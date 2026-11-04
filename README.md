@@ -61,9 +61,23 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 - **mTLS support** (New) - mutual TLS for service mesh communication
 
 ### Automatic Let's Encrypt
-- Built-in ACME client for automatic certificate management
-- HTTP-01 challenge handling at `/.well-known/acme-challenge/*`
-- Certificate auto-renewal before expiry
+- Optional built-in ACME v2 client with ES256 account signing and HTTP-01 validation
+- The server listens on TCP port 80 for `/.well-known/acme-challenge/*` while ACME is enabled
+- One certificate is issued for all configured DNS names and renewed before expiry; TLS contexts reload after renewal
+- Configure `acme_enabled`, `acme_email`, `acme_domains`, and optionally `acme_storage`, `acme_use_staging`, and `acme_directory_url`
+- Public DNS for every configured name must point to the server, inbound TCP port 80 must be reachable, and the process must be able to bind it and write the ACME storage directory
+- ACME is disabled by default; enabling it without a reachable port 80 listener prevents server startup
+
+### HTTP/3
+- Optional HTTP/3 over QUIC (UDP), disabled by default
+- Set `http3_enabled = true`; `http3_port = 0` uses the main listener port
+- HTTP/3 requires TLS certificate/key files and allows the server to bind the configured UDP port
+- Requests use the same WAF, GeoIP, rate limiting, plugin, routing, and security-header pipeline as HTTP/2
+- Open the configured UDP port in the host firewall; TCP access to the same port remains unchanged
+
+### GitHub Actions
+- Build and unit-test workflows run automatically for pushes and pull requests to `main`, and can also be started manually from the Actions tab
+- The separate **Fuzz** workflow is manual: select a fuzzer (or all targets) and the time budget per target
 
 ### Brotli & Zstd Compression
 - On-the-fly and streaming compression
@@ -102,12 +116,20 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 - **JS Challenge** - browser verification page blocking scrapers
 - **Proof-of-Work** - compute challenge for L7 DDoS mitigation
 - **Tarpit** - 1 byte/sec response drip to exhaust scanner connection pools
-- **GeoIP filtering interface** - country/Tor/VPN blocking (MaxMind compatible)
+- **GeoIP country filtering** - country blocking with MaxMind GeoLite2/GeoIP2 `.mmdb` databases
 
 ### WASM Plugin System
-- Sandboxed plugin execution for routing, auth, logging
-- Plugin hooks: ON_REQUEST, ON_RESPONSE, ON_ROUTE, ON_AUTH, ON_LOG
-- Write plugins in Rust, Go, AssemblyScript, or C
+- Built-in sandboxed interpreter for a documented WebAssembly MVP subset; no Wasmtime/Wasmer runtime dependency
+- Exported hooks: `on_request`, `on_response`, `on_route`, `on_auth`, `on_log`
+- Linear-memory limits, bounds-checked memory access, call-depth limit, and per-hook instruction/time budgets
+- `env`/`justserver` host imports for request/response data, logging, and the shared key-value store
+- Supports integer arithmetic, locals, function calls, structured control flow, and integer/float linear-memory loads and stores
+- Host string reads use `(output_ptr, capacity) -> byte_length`; string writes use `(ptr, byte_length)`. Header operations take `(name_ptr, name_length, value_ptr, value_length)`.
+- WASI, tables/references, globals, start functions, floating-point arithmetic, SIMD, and multi-value are not supported
+
+Plugins are disabled by default. Configure `wasm_enabled = true`,
+`wasm_plugin_dir`, `wasm_max_memory_mb`, and `wasm_timeout_ms` in
+`config/justserver.conf` to load `.wasm` modules and run their exported hooks.
 
 ### Path Traversal Protection
 - URI percent-decoding before validation
@@ -130,14 +152,14 @@ A high-performance C++20 web server for Linux with built-in security: DDoS prote
 - Linux (kernel 5.10+ for io_uring)
 - Clang 22+ (zero warnings policy: `-Wall -Wextra -Wpedantic -Werror`)
 - CMake 3.20+
-- OpenSSL 3.x, RE2, liburing, Brotli, Zstd
+- OpenSSL 3.x, RE2, liburing, Brotli, Zstd, libmaxminddb
 
 ### Build Steps
 
 ```bash
 # Install dependencies (Debian/Ubuntu)
 sudo apt install cmake libssl-dev libre2-dev liburing-dev \
-  libbrotli-dev libzstd-dev pkg-config
+  libbrotli-dev libzstd-dev libmaxminddb-dev pkg-config
 
 # Install Clang 22
 wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-Linux-X64.tar.xz"
@@ -210,6 +232,10 @@ The `www/` directory contains test pages:
 ## Configuration
 
 See `config/justserver.conf` for all configuration options.
+
+GeoIP filtering is opt-in. Set `antibot_geoip_enabled = true`, provide
+`antibot_geoip_database` with a MaxMind Country or City `.mmdb` file, and list
+ISO 3166-1 alpha-2 codes in `antibot_blocked_countries` separated by commas.
 
 ## Project Structure
 

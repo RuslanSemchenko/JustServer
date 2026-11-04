@@ -4,8 +4,11 @@
 #include <brotli/encode.h>
 #include <brotli/decode.h>
 #include <zstd.h>
+#include <zlib.h>
 
 #include <algorithm>
+#include <array>
+#include <climits>
 #include <cstring>
 #include <cctype>
 
@@ -93,7 +96,13 @@ CompressionAlgo Compressor::negotiate(std::string_view accept_encoding) {
 
         if (name == "zstd") supported.push_back({CompressionAlgo::ZSTD, q});
         else if (name == "br") supported.push_back({CompressionAlgo::BROTLI, q});
-        else if (name == "gzip") supported.push_back({CompressionAlgo::GZIP, q});
+        else if (name == "gzip" || name == "x-gzip") supported.push_back({CompressionAlgo::GZIP, q});
+        else if (name == "*") {
+            // Wildcard: any encoding is acceptable, offer all of ours at this quality
+            supported.push_back({CompressionAlgo::ZSTD, q});
+            supported.push_back({CompressionAlgo::BROTLI, q});
+            supported.push_back({CompressionAlgo::GZIP, q});
+        }
     }
 
     if (supported.empty()) return CompressionAlgo::NONE;
@@ -128,10 +137,10 @@ std::string Compressor::brotli_compress(std::string_view input, int quality) {
     return output;
 }
 
-std::optional<std::string> Compressor::brotli_decompress(std::string_view input) {
-    // Start with 4x input size estimate
+std::optional<std::string> Compressor::brotli_decompress(std::string_view input, size_t max_output) {
+    // Start with 4x input size estimate (bounded by the output limit)
     std::string output;
-    output.resize(input.size() * 4);
+    output.resize(std::min(std::max<size_t>(input.size() * 4, 1024), std::max<size_t>(max_output, 1)));
 
     BrotliDecoderState* state = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
     if (!state) return std::nullopt;
@@ -139,6 +148,7 @@ std::optional<std::string> Compressor::brotli_decompress(std::string_view input)
     size_t available_in = input.size();
     const uint8_t* next_in = reinterpret_cast<const uint8_t*>(input.data());
     size_t total_out = 0;
+    bool too_large = false;
 
     BrotliDecoderResult result;
     do {
@@ -149,12 +159,20 @@ std::optional<std::string> Compressor::brotli_decompress(std::string_view input)
             state, &available_in, &next_in, &available_out, &next_out, &total_out);
 
         if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
-            output.resize(output.size() * 2);
+            if (output.size() >= max_output) {
+                too_large = true;
+                break;
+            }
+            output.resize(std::min(output.size() * 2, max_output));
         }
     } while (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT);
 
     BrotliDecoderDestroyInstance(state);
 
+    if (too_large) {
+        LOG_WARN("Brotli decompression aborted: output exceeds limit");
+        return std::nullopt;
+    }
     if (result != BROTLI_DECODER_RESULT_SUCCESS) return std::nullopt;
 
     output.resize(total_out);
@@ -183,25 +201,161 @@ std::string Compressor::zstd_compress(std::string_view input, int level) {
     return output;
 }
 
-std::optional<std::string> Compressor::zstd_decompress(std::string_view input) {
-    unsigned long long decompressed_size = ZSTD_getFrameContentSize(input.data(), input.size());
+std::optional<std::string> Compressor::zstd_decompress(std::string_view input, size_t max_output) {
+    unsigned long long content_size = ZSTD_getFrameContentSize(input.data(), input.size());
+    if (content_size == ZSTD_CONTENTSIZE_ERROR) return std::nullopt;
 
-    if (decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
-        // Streaming decompression needed
-        decompressed_size = input.size() * 4;
-    } else if (decompressed_size == ZSTD_CONTENTSIZE_ERROR) {
-        return std::nullopt;
+    // Fast path: single frame with a known (and acceptable) content size
+    if (content_size != ZSTD_CONTENTSIZE_UNKNOWN) {
+        if (content_size > max_output) {
+            LOG_WARN("Zstd decompression rejected: declared size exceeds limit");
+            return std::nullopt;
+        }
+        std::string output(static_cast<size_t>(content_size), '\0');
+        size_t result = ZSTD_decompress(output.data(), output.size(), input.data(), input.size());
+        if (!ZSTD_isError(result)) {
+            output.resize(result);
+            return output;
+        }
+        // Fall through to streaming (e.g. multiple concatenated frames)
     }
 
-    std::string output(static_cast<size_t>(decompressed_size), '\0');
+    // Streaming path: unknown content size (streaming compressor output) or multi-frame input
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx) return std::nullopt;
 
-    size_t result = ZSTD_decompress(
-        output.data(), output.size(),
-        input.data(), input.size());
+    std::string output;
+    ZSTD_inBuffer in_buf = {input.data(), input.size(), 0};
+    std::array<char, 16384> buf{};
+    size_t last_ret = 0;
 
-    if (ZSTD_isError(result)) return std::nullopt;
+    while (in_buf.pos < in_buf.size) {
+        ZSTD_outBuffer out_buf = {buf.data(), buf.size(), 0};
+        last_ret = ZSTD_decompressStream(dctx, &out_buf, &in_buf);
+        if (ZSTD_isError(last_ret)) {
+            ZSTD_freeDCtx(dctx);
+            return std::nullopt;
+        }
+        if (output.size() + out_buf.pos > max_output) {
+            ZSTD_freeDCtx(dctx);
+            LOG_WARN("Zstd decompression aborted: output exceeds limit");
+            return std::nullopt;
+        }
+        output.append(buf.data(), out_buf.pos);
+    }
 
-    output.resize(result);
+    // Drain any output still buffered inside the decoder
+    while (last_ret != 0) {
+        ZSTD_outBuffer out_buf = {buf.data(), buf.size(), 0};
+        last_ret = ZSTD_decompressStream(dctx, &out_buf, &in_buf);
+        if (ZSTD_isError(last_ret) || out_buf.pos == 0) break;
+        if (output.size() + out_buf.pos > max_output) {
+            ZSTD_freeDCtx(dctx);
+            return std::nullopt;
+        }
+        output.append(buf.data(), out_buf.pos);
+    }
+
+    ZSTD_freeDCtx(dctx);
+
+    // last_ret != 0 means the final frame is truncated
+    if (last_ret != 0) return std::nullopt;
+    return output;
+}
+
+// === Gzip (zlib) ===
+
+std::string Compressor::gzip_compress(std::string_view input, int level) {
+    if (level < 0 || level > 9) level = GZIP_DEFAULT_LEVEL;
+
+    z_stream zs{};
+    // windowBits 15 + 16 => gzip wrapper (RFC 1952) instead of raw zlib
+    if (deflateInit2(&zs, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        LOG_WARN("Gzip compression init failed");
+        return std::string(input);
+    }
+
+    std::string output;
+    output.resize(deflateBound(&zs, static_cast<uLong>(input.size())) + 32);
+
+    zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
+    zs.next_out = reinterpret_cast<Bytef*>(output.data());
+
+    // zlib counters are 32-bit: feed huge inputs in slices
+    size_t remaining_in = input.size();
+    int ret = Z_OK;
+    while (ret == Z_OK) {
+        uInt in_chunk = static_cast<uInt>(std::min<size_t>(remaining_in, UINT_MAX));
+        zs.avail_in = in_chunk;
+        size_t out_left = output.size() - static_cast<size_t>(
+            reinterpret_cast<char*>(zs.next_out) - output.data());
+        zs.avail_out = static_cast<uInt>(std::min<size_t>(out_left, UINT_MAX));
+
+        bool last = (in_chunk == remaining_in);
+        ret = deflate(&zs, last ? Z_FINISH : Z_NO_FLUSH);
+        remaining_in -= in_chunk - zs.avail_in;
+        if (ret == Z_OK && zs.avail_out == 0) {
+            size_t used = static_cast<size_t>(reinterpret_cast<char*>(zs.next_out) - output.data());
+            output.resize(output.size() * 2);
+            zs.next_out = reinterpret_cast<Bytef*>(output.data()) + used;
+        }
+    }
+
+    size_t produced = static_cast<size_t>(reinterpret_cast<char*>(zs.next_out) - output.data());
+    deflateEnd(&zs);
+
+    if (ret != Z_STREAM_END) {
+        LOG_WARN("Gzip compression failed");
+        return std::string(input);
+    }
+
+    output.resize(produced);
+    return output;
+}
+
+std::optional<std::string> Compressor::gzip_decompress(std::string_view input, size_t max_output) {
+    z_stream zs{};
+    // windowBits 15 + 32 => auto-detect gzip or zlib header
+    if (inflateInit2(&zs, 15 + 32) != Z_OK) return std::nullopt;
+
+    std::string output;
+    std::array<char, 16384> buf{};
+
+    size_t consumed = 0;
+    int ret = Z_OK;
+    while (true) {
+        if (zs.avail_in == 0 && consumed < input.size()) {
+            uInt in_chunk = static_cast<uInt>(std::min<size_t>(input.size() - consumed, UINT_MAX));
+            zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data() + consumed));
+            zs.avail_in = in_chunk;
+            consumed += in_chunk;
+        }
+
+        zs.next_out = reinterpret_cast<Bytef*>(buf.data());
+        zs.avail_out = static_cast<uInt>(buf.size());
+
+        ret = inflate(&zs, Z_NO_FLUSH);
+        size_t produced = buf.size() - zs.avail_out;
+
+        if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) break;
+        if (output.size() + produced > max_output) {
+            inflateEnd(&zs);
+            LOG_WARN("Gzip decompression aborted: output exceeds limit");
+            return std::nullopt;
+        }
+        output.append(buf.data(), produced);
+
+        if (ret == Z_STREAM_END) {
+            // Support concatenated gzip members (RFC 1952 section 2.2)
+            if (zs.avail_in == 0 && consumed >= input.size()) break;
+            if (inflateReset(&zs) != Z_OK) break;
+            continue;
+        }
+        if (ret == Z_BUF_ERROR && zs.avail_in == 0 && consumed >= input.size()) break; // Truncated
+    }
+
+    inflateEnd(&zs);
+    if (ret != Z_STREAM_END) return std::nullopt;
     return output;
 }
 
@@ -211,18 +365,20 @@ std::string Compressor::compress(std::string_view input, CompressionAlgo algo, i
     switch (algo) {
         case CompressionAlgo::BROTLI: return brotli_compress(input, quality);
         case CompressionAlgo::ZSTD:   return zstd_compress(input, quality);
-        case CompressionAlgo::GZIP:
-            // TODO: Implement gzip as legacy fallback
-            return std::string(input);
+        case CompressionAlgo::GZIP:   return gzip_compress(input, quality);
         default: return std::string(input);
     }
 }
 
-std::optional<std::string> Compressor::decompress(std::string_view input, CompressionAlgo algo) {
+std::optional<std::string> Compressor::decompress(std::string_view input, CompressionAlgo algo,
+                                                  size_t max_output) {
     switch (algo) {
-        case CompressionAlgo::BROTLI: return brotli_decompress(input);
-        case CompressionAlgo::ZSTD:   return zstd_decompress(input);
-        default: return std::string(input);
+        case CompressionAlgo::BROTLI: return brotli_decompress(input, max_output);
+        case CompressionAlgo::ZSTD:   return zstd_decompress(input, max_output);
+        case CompressionAlgo::GZIP:   return gzip_decompress(input, max_output);
+        default:
+            if (input.size() > max_output) return std::nullopt;
+            return std::string(input);
     }
 }
 
@@ -248,6 +404,16 @@ StreamingCompressor::StreamingCompressor(CompressionAlgo algo, int quality) : al
             }
             break;
         }
+        case CompressionAlgo::GZIP: {
+            auto* zs = new z_stream{};
+            int lvl = (quality < 0 || quality > 9) ? Compressor::GZIP_DEFAULT_LEVEL : quality;
+            if (deflateInit2(zs, lvl, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) == Z_OK) {
+                ctx_ = zs;
+            } else {
+                delete zs;
+            }
+            break;
+        }
         default: break;
     }
 }
@@ -259,6 +425,13 @@ StreamingCompressor::~StreamingCompressor() {
             break;
         case CompressionAlgo::ZSTD:
             if (ctx_) ZSTD_freeCCtx(static_cast<ZSTD_CCtx*>(ctx_));
+            break;
+        case CompressionAlgo::GZIP:
+            if (ctx_) {
+                auto* zs = static_cast<z_stream*>(ctx_);
+                deflateEnd(zs);
+                delete zs;
+            }
             break;
         default: break;
     }
@@ -296,8 +469,27 @@ std::string StreamingCompressor::feed(std::string_view input) {
             while (in_buf.pos < in_buf.size) {
                 uint8_t buf[8192];
                 ZSTD_outBuffer out_buf = {buf, sizeof(buf), 0};
-                ZSTD_compressStream2(cctx, &out_buf, &in_buf, ZSTD_e_continue);
+                size_t ret = ZSTD_compressStream2(cctx, &out_buf, &in_buf, ZSTD_e_continue);
+                if (ZSTD_isError(ret)) break;
                 output.append(reinterpret_cast<char*>(buf), out_buf.pos);
+            }
+            break;
+        }
+        case CompressionAlgo::GZIP: {
+            auto* zs = static_cast<z_stream*>(ctx_);
+            size_t offset = 0;
+            while (offset < input.size()) {
+                uInt in_chunk = static_cast<uInt>(std::min<size_t>(input.size() - offset, UINT_MAX));
+                zs->next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data() + offset));
+                zs->avail_in = in_chunk;
+                do {
+                    uint8_t buf[8192];
+                    zs->next_out = buf;
+                    zs->avail_out = sizeof(buf);
+                    if (deflate(zs, Z_NO_FLUSH) == Z_STREAM_ERROR) return output;
+                    output.append(reinterpret_cast<char*>(buf), sizeof(buf) - zs->avail_out);
+                } while (zs->avail_out == 0);
+                offset += in_chunk;
             }
             break;
         }
@@ -341,8 +533,24 @@ std::string StreamingCompressor::finish() {
                 uint8_t buf[8192];
                 ZSTD_outBuffer out_buf = {buf, sizeof(buf), 0};
                 remaining = ZSTD_compressStream2(cctx, &out_buf, &in_buf, ZSTD_e_end);
+                if (ZSTD_isError(remaining)) break;
                 output.append(reinterpret_cast<char*>(buf), out_buf.pos);
             } while (remaining > 0);
+            break;
+        }
+        case CompressionAlgo::GZIP: {
+            auto* zs = static_cast<z_stream*>(ctx_);
+            zs->next_in = nullptr;
+            zs->avail_in = 0;
+            int ret;
+            do {
+                uint8_t buf[8192];
+                zs->next_out = buf;
+                zs->avail_out = sizeof(buf);
+                ret = deflate(zs, Z_FINISH);
+                if (ret == Z_STREAM_ERROR) break;
+                output.append(reinterpret_cast<char*>(buf), sizeof(buf) - zs->avail_out);
+            } while (ret != Z_STREAM_END);
             break;
         }
         default: break;

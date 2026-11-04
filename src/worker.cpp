@@ -16,9 +16,11 @@
 namespace js {
 
 Worker::Worker(const Config& config, TLSContext* tls, WAF* waf,
-               DDoSGuard* ddos, FileHandler* file_handler, FastCGIClient* fcgi)
+               DDoSGuard* ddos, FileHandler* file_handler, FastCGIClient* fcgi,
+               GeoIPFilter* geoip_filter, PluginManager* plugin_manager)
     : config_(config), tls_(tls), waf_(waf), ddos_(ddos),
-      file_handler_(file_handler), fcgi_(fcgi) {}
+      file_handler_(file_handler), fcgi_(fcgi), geoip_filter_(geoip_filter),
+      plugin_manager_(plugin_manager) {}
 
 void Worker::apply_security_headers(HttpResponse& resp) const {
     const auto& sh = config_.security_headers;
@@ -58,31 +60,8 @@ void Worker::handle_h2_connection(SSL* ssl, int client_fd, const std::string& cl
     // gRPC handler for this connection
     GrpcHandler grpc;
 
-    Http2Connection h2_conn([this, &grpc, &client_ip](const HttpRequest& req) -> HttpResponse {
-        // WAF inspection for HTTP/2 requests
-        if (config_.waf_enabled && waf_) {
-            auto verdict = waf_->inspect(req, config_.waf_body_inspection_limit);
-            if (verdict.blocked) {
-                Metrics::instance().record_waf_block();
-                return HttpResponse::make_error(verdict.status_code, verdict.reason);
-            }
-        }
-
-        // Rate limit check for HTTP/2 requests
-        if (ddos_ && !ddos_->allow_request(client_ip)) {
-            return HttpResponse::make_error(429, "Too Many Requests");
-        }
-
-        // Route gRPC requests through the gRPC handler
-        if (GrpcHandler::is_grpc_request(req)) {
-            auto resp = grpc.handle(req);
-            apply_security_headers(resp);
-            return resp;
-        }
-
-        auto resp = route_request(req, client_ip);
-        apply_security_headers(resp);
-        return resp;
+    Http2Connection h2_conn([this, &grpc, &client_ip](const HttpRequest& req) {
+        return process_request(req, client_ip, grpc);
     });
 
     std::array<char, 16384> buf{};
@@ -125,6 +104,69 @@ done:
     ddos_->release_connection(client_ip);
     Metrics::instance().record_disconnection();
     Metrics::instance().record_worker_idle();
+}
+
+HttpResponse Worker::handle_http3_request(const HttpRequest& req,
+                                          const std::string& client_ip) {
+    GrpcHandler grpc;
+    return process_request(req, client_ip, grpc);
+}
+
+HttpResponse Worker::process_request(const HttpRequest& input_req,
+                                     const std::string& client_ip,
+                                     GrpcHandler& grpc) {
+    HttpRequest req = input_req;
+    if (config_.geoip_enabled && geoip_filter_ &&
+        geoip_filter_->is_blocked(client_ip)) {
+        Metrics::instance().record_blocked_ip();
+        return HttpResponse::make_error(403, "Access denied");
+    }
+
+    if (config_.waf_enabled && waf_) {
+        auto verdict = waf_->inspect(req, config_.waf_body_inspection_limit);
+        if (verdict.blocked) {
+            Metrics::instance().record_waf_block();
+            return HttpResponse::make_error(verdict.status_code, verdict.reason);
+        }
+    }
+
+    if (ddos_ && !ddos_->allow_request(client_ip)) {
+        return HttpResponse::make_error(429, "Too Many Requests");
+    }
+
+    HttpResponse resp;
+    if (plugin_manager_) {
+        auto plugin_result = plugin_manager_->execute_hook(
+            PluginHook::ON_REQUEST, req, resp, client_ip);
+        if (!plugin_result.continue_processing) {
+            if (!plugin_result.error.empty()) {
+                resp = HttpResponse::make_error(500, "Plugin execution failed");
+            }
+            auto response_hook = plugin_manager_->execute_hook(
+                PluginHook::ON_RESPONSE, req, resp, client_ip);
+            if (!response_hook.error.empty()) {
+                LOG_ERROR("WASM response hook failed: " + response_hook.error);
+            }
+            apply_security_headers(resp);
+            return resp;
+        }
+    }
+
+    if (GrpcHandler::is_grpc_request(req)) {
+        resp = grpc.handle(req);
+    } else {
+        resp = route_request(req, client_ip);
+    }
+
+    if (plugin_manager_) {
+        auto plugin_result = plugin_manager_->execute_hook(
+            PluginHook::ON_RESPONSE, req, resp, client_ip);
+        if (!plugin_result.error.empty()) {
+            LOG_ERROR("WASM response hook failed: " + plugin_result.error);
+        }
+    }
+    apply_security_headers(resp);
+    return resp;
 }
 
 void Worker::handle_connection(int client_fd, const std::string& client_ip) {
@@ -201,7 +243,30 @@ void Worker::handle_connection(int client_fd, const std::string& client_ip) {
         return;
     }
 
-    const auto& req = parser.request();
+    HttpRequest req = parser.request();
+
+    if (config_.geoip_enabled && geoip_filter_ &&
+        geoip_filter_->is_blocked(client_ip)) {
+        Metrics::instance().record_blocked_ip();
+        auto resp = HttpResponse::make_error(403, "Access denied");
+        apply_security_headers(resp);
+        if (ssl) {
+            send_response(ssl, client_fd, resp);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+        } else {
+            send_response_plain(client_fd, resp);
+        }
+
+        auto elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start_time).count();
+        Metrics::instance().record_request(403, elapsed);
+        close(client_fd);
+        ddos_->release_connection(client_ip);
+        Metrics::instance().record_disconnection();
+        Metrics::instance().record_worker_idle();
+        return;
+    }
 
     // WAF inspection
     if (config_.waf_enabled && waf_) {
@@ -253,6 +318,38 @@ void Worker::handle_connection(int client_fd, const std::string& client_ip) {
         return;
     }
 
+    if (plugin_manager_) {
+        HttpResponse plugin_response;
+        auto plugin_result = plugin_manager_->execute_hook(
+            PluginHook::ON_REQUEST, req, plugin_response, client_ip);
+        if (!plugin_result.continue_processing) {
+            if (!plugin_result.error.empty()) {
+                plugin_response = HttpResponse::make_error(500, "Plugin execution failed");
+            }
+            auto response_hook = plugin_manager_->execute_hook(
+                PluginHook::ON_RESPONSE, req, plugin_response, client_ip);
+            if (!response_hook.error.empty()) {
+                LOG_ERROR("WASM response hook failed: " + response_hook.error);
+            }
+            apply_security_headers(plugin_response);
+            if (ssl) {
+                send_response(ssl, client_fd, plugin_response);
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+            } else {
+                send_response_plain(client_fd, plugin_response);
+            }
+            auto elapsed = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start_time).count();
+            Metrics::instance().record_request(plugin_response.status_code, elapsed);
+            close(client_fd);
+            ddos_->release_connection(client_ip);
+            Metrics::instance().record_disconnection();
+            Metrics::instance().record_worker_idle();
+            return;
+        }
+    }
+
     // Check for WebSocket upgrade request
     if (WsHandshake::is_upgrade_request(req)) {
         handle_websocket(ssl, client_fd, client_ip, req);
@@ -260,7 +357,9 @@ void Worker::handle_connection(int client_fd, const std::string& client_ip) {
     }
 
     // Try zero-copy sendfile for plain (non-TLS) static file requests
-    if (!ssl && !is_php_request(req.path) && req.path != "/metrics") {
+    bool run_response_plugins = plugin_manager_ &&
+        plugin_manager_->has_plugins_for(PluginHook::ON_RESPONSE);
+    if (!ssl && !run_response_plugins && !is_php_request(req.path) && req.path != "/metrics") {
         if (try_sendfile(client_fd, req)) {
             auto elapsed = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start_time).count();
@@ -276,6 +375,13 @@ void Worker::handle_connection(int client_fd, const std::string& client_ip) {
 
     // Route and handle request
     auto resp = route_request(req, client_ip);
+    if (plugin_manager_) {
+        auto plugin_result = plugin_manager_->execute_hook(
+            PluginHook::ON_RESPONSE, req, resp, client_ip);
+        if (!plugin_result.error.empty()) {
+            LOG_ERROR("WASM response hook failed: " + plugin_result.error);
+        }
+    }
     apply_security_headers(resp);
 
     auto elapsed = std::chrono::duration<double, std::milli>(

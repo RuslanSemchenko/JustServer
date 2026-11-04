@@ -1,4 +1,5 @@
 #include "wasm_plugin.hpp"
+#include "wasm_interpreter.hpp"
 #include "logger.hpp"
 
 #include <filesystem>
@@ -40,7 +41,8 @@ bool PluginManager::load_plugins() {
 bool PluginManager::load_plugin(const std::string& path) {
     LOG_INFO("Loading WASM plugin: " + path);
 
-    auto runtime = std::make_unique<StubWasmRuntime>();
+    auto runtime = std::make_unique<WasmInterpreter>(
+        config_.max_memory_per_plugin, config_.execution_timeout);
     if (!runtime->load_module(path)) {
         LOG_ERROR("Failed to load WASM module: " + path);
         return false;
@@ -129,6 +131,7 @@ PluginResult PluginManager::execute_hook(PluginHook hook, HttpRequest& req, Http
             kv_store_[key] = value;
         };
 
+        std::lock_guard runtime_lock(*plugin.runtime_mutex);
         plugin.runtime->set_host_functions(funcs);
 
         // Call the appropriate hook function
@@ -142,6 +145,13 @@ PluginResult PluginManager::execute_hook(PluginHook hook, HttpRequest& req, Http
         }
 
         auto ret = plugin.runtime->call_function(hook_name);
+        if (!ret) {
+            result.continue_processing = false;
+            result.error = plugin.runtime->last_error();
+            LOG_ERROR("[plugin:" + plugin.info.name + "] " +
+                      (result.error.empty() ? "hook execution failed" : result.error));
+            break;
+        }
         if (ret && *ret != 0) {
             // Plugin returned non-zero = stop processing
             result.continue_processing = false;
@@ -168,45 +178,6 @@ bool PluginManager::has_plugins_for(PluginHook hook) const {
         }
     }
     return false;
-}
-
-// === StubWasmRuntime ===
-
-bool StubWasmRuntime::load_module(const std::string& path) {
-    LOG_WARN("WASM: Stub runtime loading " + path +
-             " (install Wasmtime for real WASM execution)");
-    return std::filesystem::exists(path);
-}
-
-bool StubWasmRuntime::load_module_bytes([[maybe_unused]] const uint8_t* data,
-                                          [[maybe_unused]] size_t len) {
-    LOG_WARN("WASM: Stub runtime (no real WASM execution available)");
-    return true;
-}
-
-std::optional<int32_t> StubWasmRuntime::call_function(const std::string& name) {
-    LOG_DEBUG("WASM stub: call_function(" + name + ") - no-op");
-    return 0; // Success, continue processing
-}
-
-void StubWasmRuntime::set_host_functions([[maybe_unused]] const PluginHostFunctions& funcs) {
-    // Stub: no-op
-}
-
-bool StubWasmRuntime::write_memory([[maybe_unused]] uint32_t offset,
-                                     [[maybe_unused]] const void* data,
-                                     [[maybe_unused]] size_t len) {
-    return false;
-}
-
-bool StubWasmRuntime::read_memory([[maybe_unused]] uint32_t offset,
-                                    [[maybe_unused]] void* data,
-                                    [[maybe_unused]] size_t len) {
-    return false;
-}
-
-PluginInfo StubWasmRuntime::get_info() const {
-    return {"stub", "0.0.0", "Stub WASM runtime", "JustServer", {}};
 }
 
 } // namespace js

@@ -1,0 +1,46 @@
+name: Install JustServer build dependencies
+description: Install system packages and build ngtcp2/nghttp3 for JustServer
+
+runs:
+  using: composite
+  steps:
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake git pkg-config wget \
+          libssl-dev zlib1g-dev libre2-dev liburing-dev \
+          libbrotli-dev libzstd-dev libmaxminddb-dev libgnutls28-dev
+
+    - name: Install Clang 23
+      shell: bash
+      run: |
+        wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-X64.tar.xz
+        tar -xf LLVM-23.1.3-Linux-X64.tar.xz
+        echo "$PWD/LLVM-23.1.3-Linux-X64/bin" >> "$GITHUB_PATH"
+
+    - name: Build and install nghttp3
+      shell: bash
+      run: |
+        git clone --depth 1 https://github.com/ngtcp2/nghttp3.git /tmp/nghttp3
+        cmake -S /tmp/nghttp3 -B /tmp/nghttp3/build \
+          -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF
+        cmake --build /tmp/nghttp3/build --parallel "$(nproc)"
+        sudo cmake --install /tmp/nghttp3/build
+
+    - name: Build and install ngtcp2 with GnuTLS
+      shell: bash
+      run: |
+        git clone --depth 1 https://github.com/ngtcp2/ngtcp2.git /tmp/ngtcp2
+        cmake -S /tmp/ngtcp2 -B /tmp/ngtcp2/build \
+          -DENABLE_OPENSSL=OFF \
+          -DENABLE_GNUTLS=ON \
+          -DENABLE_WOLFSSL=OFF \
+          -DENABLE_BORINGSSL=OFF \
+          -DENABLE_PICOTLS=OFF \
+          -DENABLE_LIB_ONLY=ON \
+          -DBUILD_TESTING=OFF
+        cmake --build /tmp/ngtcp2/build --parallel "$(nproc)"
+        sudo cmake --install /tmp/ngtcp2/build
+        sudo ldconfig

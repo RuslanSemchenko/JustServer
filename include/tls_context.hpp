@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <mutex>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -31,7 +32,7 @@ public:
     static NegotiatedProtocol get_negotiated_protocol(SSL* ssl);
 
     // Get the raw SSL_CTX
-    SSL_CTX* native() const { return ctx_; }
+    SSL_CTX* native() const;
 
 private:
     // ALPN selection callback
@@ -41,6 +42,7 @@ private:
                                     void* arg);
 
     SSL_CTX* ctx_ = nullptr;
+    mutable std::mutex ctx_mutex_;
 };
 
 } // namespace js

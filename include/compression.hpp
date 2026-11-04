@@ -23,16 +23,26 @@ public:
     // quality: 0-11 for brotli, 1-22 for zstd, 1-9 for gzip
     static std::string compress(std::string_view input, CompressionAlgo algo, int quality = -1);
 
-    // Decompress data (auto-detects format)
-    static std::optional<std::string> decompress(std::string_view input, CompressionAlgo algo);
+    // Decompress data produced by the given algorithm.
+    // Returns std::nullopt on corrupt input or if the output would exceed max_output
+    // (decompression bomb protection).
+    static std::optional<std::string> decompress(std::string_view input, CompressionAlgo algo,
+                                                 size_t max_output = MAX_DECOMPRESSED_SIZE);
 
     // Brotli compression/decompression
     static std::string brotli_compress(std::string_view input, int quality = 4);
-    static std::optional<std::string> brotli_decompress(std::string_view input);
+    static std::optional<std::string> brotli_decompress(std::string_view input,
+                                                        size_t max_output = MAX_DECOMPRESSED_SIZE);
 
     // Zstd compression/decompression
     static std::string zstd_compress(std::string_view input, int level = 3);
-    static std::optional<std::string> zstd_decompress(std::string_view input);
+    static std::optional<std::string> zstd_decompress(std::string_view input,
+                                                      size_t max_output = MAX_DECOMPRESSED_SIZE);
+
+    // Gzip (RFC 1952) compression/decompression via zlib -- legacy fallback
+    static std::string gzip_compress(std::string_view input, int level = 6);
+    static std::optional<std::string> gzip_decompress(std::string_view input,
+                                                      size_t max_output = MAX_DECOMPRESSED_SIZE);
 
     // Parse Accept-Encoding header and return the best algorithm we support
     static CompressionAlgo negotiate(std::string_view accept_encoding);
@@ -45,6 +55,10 @@ public:
     static constexpr int BROTLI_BEST_QUALITY = 11;   // Maximum compression
     static constexpr int ZSTD_FAST_LEVEL = 3;        // Good balance
     static constexpr int ZSTD_BEST_LEVEL = 19;       // Maximum compression
+    static constexpr int GZIP_DEFAULT_LEVEL = 6;     // zlib default
+
+    // Upper bound for decompressed output (protects against decompression bombs)
+    static constexpr size_t MAX_DECOMPRESSED_SIZE = 64 * 1024 * 1024;
 
     // Minimum size to bother compressing (bytes)
     static constexpr size_t MIN_COMPRESS_SIZE = 256;
@@ -69,9 +83,11 @@ public:
     // Finish compression, flush remaining data
     std::string finish();
 
+    CompressionAlgo algo() const { return algo_; }
+
 private:
     CompressionAlgo algo_;
-    void* ctx_ = nullptr; // Algorithm-specific context (BrotliEncoderState*, ZSTD_CCtx*, etc.)
+    void* ctx_ = nullptr; // Algorithm-specific context (BrotliEncoderState*, ZSTD_CCtx*, z_stream*)
 };
 
 } // namespace js

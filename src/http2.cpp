@@ -758,26 +758,79 @@ std::string HPACKEncoder::encode(const std::vector<std::pair<std::string, std::s
     return result;
 }
 
+
 // ===== Http2Connection =====
+
+namespace {
+
+// Connection-specific header fields are forbidden in HTTP/2 (RFC 9113 Section 8.2.2)
+bool is_connection_specific_header(std::string_view name) {
+    return name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
+           name == "transfer-encoding" || name == "upgrade";
+}
+
+std::string to_lower_copy(std::string_view s) {
+    std::string out(s);
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
+uint32_t read_u32(std::string_view p, size_t off) {
+    return (static_cast<uint32_t>(static_cast<uint8_t>(p[off])) << 24) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(p[off + 1])) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(p[off + 2])) << 8) |
+           static_cast<uint32_t>(static_cast<uint8_t>(p[off + 3]));
+}
+
+HttpMethod parse_method(std::string_view m) {
+    if (m == "GET") return HttpMethod::GET;
+    if (m == "POST") return HttpMethod::POST;
+    if (m == "HEAD") return HttpMethod::HEAD;
+    if (m == "PUT") return HttpMethod::PUT;
+    if (m == "DELETE") return HttpMethod::DELETE_;
+    if (m == "OPTIONS") return HttpMethod::OPTIONS;
+    if (m == "PATCH") return HttpMethod::PATCH;
+    return HttpMethod::UNKNOWN;
+}
+
+// Responses with these status codes never carry a body (RFC 9110 Section 6.4.1)
+bool status_forbids_body(int status) {
+    return (status >= 100 && status < 200) || status == 204 || status == 304;
+}
+
+} // namespace
 
 Http2Connection::Http2Connection(RequestHandler handler)
     : handler_(std::move(handler)) {}
 
+bool Http2Connection::has_pending_output() const {
+    for (const auto& [id, stream] : streams_) {
+        if (stream.response_queued && !stream.response_done) return true;
+    }
+    return false;
+}
+
 std::string Http2Connection::process_input(std::span<const char> data) {
+    if (goaway_sent_) return {};
+
     buffer_.append(data.data(), data.size());
     std::string output;
 
     // Check for client preface
     if (!preface_received_) {
         if (buffer_.size() < CLIENT_PREFACE.size()) {
+            // Reject early if what we have so far cannot be the preface
+            if (std::string_view(buffer_) != CLIENT_PREFACE.substr(0, buffer_.size())) {
+                LOG_WARN("HTTP/2: Invalid client connection preface");
+                return build_goaway(H2Error::PROTOCOL_ERROR, "Invalid preface");
+            }
             return output; // Need more data
         }
 
-        if (buffer_.substr(0, CLIENT_PREFACE.size()) != CLIENT_PREFACE) {
+        if (std::string_view(buffer_).substr(0, CLIENT_PREFACE.size()) != CLIENT_PREFACE) {
             LOG_WARN("HTTP/2: Invalid client connection preface");
-            output += build_goaway(H2Error::PROTOCOL_ERROR, "Invalid preface");
-            goaway_sent_ = true;
-            return output;
+            return build_goaway(H2Error::PROTOCOL_ERROR, "Invalid preface");
         }
 
         buffer_.erase(0, CLIENT_PREFACE.size());
@@ -789,13 +842,23 @@ std::string Http2Connection::process_input(std::span<const char> data) {
     }
 
     // Process frames
-    while (true) {
+    while (!goaway_sent_) {
         auto frame = parse_frame();
-        if (!frame) break;
+        if (!frame) {
+            if (frame_size_error_) {
+                output += build_goaway(H2Error::FRAME_SIZE_ERROR, "Frame exceeds SETTINGS_MAX_FRAME_SIZE");
+            }
+            break;
+        }
+
+        // While a header block is open only CONTINUATION frames for that stream are allowed
+        if (continuation_stream_id_ != 0 &&
+            (frame->type != H2FrameType::CONTINUATION || frame->stream_id != continuation_stream_id_)) {
+            output += build_goaway(H2Error::PROTOCOL_ERROR, "Expected CONTINUATION");
+            break;
+        }
 
         output += handle_frame(*frame);
-
-        if (goaway_sent_) break;
     }
 
     return output;
@@ -824,8 +887,9 @@ std::optional<H2Frame> Http2Connection::parse_frame() {
                       (static_cast<uint32_t>(static_cast<uint8_t>(buffer_[7])) << 8) |
                       static_cast<uint32_t>(static_cast<uint8_t>(buffer_[8]));
 
-    // Check frame size
-    if (frame.length > max_frame_size_) {
+    // Frames larger than what we advertised are a connection error
+    if (frame.length > LOCAL_MAX_FRAME_SIZE) {
+        frame_size_error_ = true;
         return std::nullopt;
     }
 
@@ -840,14 +904,21 @@ std::optional<H2Frame> Http2Connection::parse_frame() {
 
 std::string Http2Connection::handle_frame(const H2Frame& frame) {
     switch (frame.type) {
-        case H2FrameType::SETTINGS:    return handle_settings(frame);
-        case H2FrameType::HEADERS:     return handle_headers(frame);
-        case H2FrameType::DATA:        return handle_data(frame);
+        case H2FrameType::SETTINGS:      return handle_settings(frame);
+        case H2FrameType::HEADERS:       return handle_headers(frame);
+        case H2FrameType::CONTINUATION:  return handle_continuation(frame);
+        case H2FrameType::DATA:          return handle_data(frame);
         case H2FrameType::WINDOW_UPDATE: return handle_window_update(frame);
-        case H2FrameType::PING:        return handle_ping(frame);
-        case H2FrameType::GOAWAY:      return handle_goaway(frame);
-        case H2FrameType::RST_STREAM:  return {}; // Acknowledged
-        case H2FrameType::PRIORITY:    return {}; // Advisory only
+        case H2FrameType::PING:          return handle_ping(frame);
+        case H2FrameType::GOAWAY:        return handle_goaway(frame);
+        case H2FrameType::RST_STREAM:    return handle_rst_stream(frame);
+        case H2FrameType::PRIORITY:
+            if (frame.stream_id == 0) return build_goaway(H2Error::PROTOCOL_ERROR);
+            if (frame.payload.size() != 5) return build_rst_stream(frame.stream_id, H2Error::FRAME_SIZE_ERROR);
+            return {}; // Advisory only
+        case H2FrameType::PUSH_PROMISE:
+            // Clients must never send PUSH_PROMISE (RFC 9113 Section 8.4)
+            return build_goaway(H2Error::PROTOCOL_ERROR, "PUSH_PROMISE from client");
         default:
             // Unknown frame types are ignored per spec
             return {};
@@ -855,8 +926,13 @@ std::string Http2Connection::handle_frame(const H2Frame& frame) {
 }
 
 std::string Http2Connection::handle_settings(const H2Frame& frame) {
+    if (frame.stream_id != 0) {
+        return build_goaway(H2Error::PROTOCOL_ERROR, "SETTINGS on a stream");
+    }
+
     if (frame.has_flag(0x1)) {
-        // Settings ACK - no payload
+        // Settings ACK must not carry a payload
+        if (!frame.payload.empty()) return build_goaway(H2Error::FRAME_SIZE_ERROR);
         return {};
     }
 
@@ -865,28 +941,41 @@ std::string Http2Connection::handle_settings(const H2Frame& frame) {
         return build_goaway(H2Error::FRAME_SIZE_ERROR, "Invalid SETTINGS frame size");
     }
 
+    bool window_changed = false;
     for (size_t i = 0; i < frame.payload.size(); i += 6) {
         uint16_t id = (static_cast<uint16_t>(static_cast<uint8_t>(frame.payload[i])) << 8) |
                       static_cast<uint16_t>(static_cast<uint8_t>(frame.payload[i + 1]));
-        uint32_t value = (static_cast<uint32_t>(static_cast<uint8_t>(frame.payload[i + 2])) << 24) |
-                         (static_cast<uint32_t>(static_cast<uint8_t>(frame.payload[i + 3])) << 16) |
-                         (static_cast<uint32_t>(static_cast<uint8_t>(frame.payload[i + 4])) << 8) |
-                         static_cast<uint32_t>(static_cast<uint8_t>(frame.payload[i + 5]));
+        uint32_t value = read_u32(frame.payload, i + 2);
 
         switch (static_cast<H2Setting>(id)) {
             case H2Setting::HEADER_TABLE_SIZE:
+                // Limits the peer's decoder table, i.e. OUR encoder (which never indexes).
+                // Our decoder keeps the size we advertised.
                 header_table_size_ = value;
-                decoder_.set_max_table_size(value);
+                break;
+            case H2Setting::ENABLE_PUSH:
+                if (value > 1) return build_goaway(H2Error::PROTOCOL_ERROR);
                 break;
             case H2Setting::MAX_CONCURRENT_STREAMS:
                 max_concurrent_streams_ = value;
                 break;
-            case H2Setting::INITIAL_WINDOW_SIZE:
+            case H2Setting::INITIAL_WINDOW_SIZE: {
                 if (value > 0x7FFFFFFF) {
                     return build_goaway(H2Error::FLOW_CONTROL_ERROR);
                 }
+                // Adjust every open stream's send window by the delta (RFC 9113 Section 6.9.2)
+                int64_t delta = static_cast<int64_t>(value) - static_cast<int64_t>(initial_window_size_);
+                for (auto& [sid, stream] : streams_) {
+                    int64_t updated = static_cast<int64_t>(stream.window_size) + delta;
+                    if (updated > 0x7FFFFFFF) {
+                        return build_goaway(H2Error::FLOW_CONTROL_ERROR);
+                    }
+                    stream.window_size = static_cast<int32_t>(updated);
+                }
                 initial_window_size_ = value;
+                window_changed = true;
                 break;
+            }
             case H2Setting::MAX_FRAME_SIZE:
                 if (value < 16384 || value > 16777215) {
                     return build_goaway(H2Error::PROTOCOL_ERROR);
@@ -898,16 +987,16 @@ std::string Http2Connection::handle_settings(const H2Frame& frame) {
         }
     }
 
-    // Send SETTINGS ACK
-    return build_settings_frame(true);
+    // Send SETTINGS ACK (then any data unblocked by a larger window)
+    std::string output = build_settings_frame(true);
+    if (window_changed) output += flush_all();
+    return output;
 }
 
 std::string Http2Connection::handle_headers(const H2Frame& frame) {
     if (frame.stream_id == 0) {
         return build_goaway(H2Error::PROTOCOL_ERROR, "HEADERS on stream 0");
     }
-
-    auto& stream = get_or_create_stream(frame.stream_id);
 
     std::string_view payload(frame.payload);
 
@@ -922,6 +1011,11 @@ std::string Http2Connection::handle_headers(const H2Frame& frame) {
 
     // Handle priority
     if (frame.has_flag(H2Flags::PRIORITY)) {
+        if (payload.size() < offset + 5) return build_goaway(H2Error::PROTOCOL_ERROR);
+        uint32_t dependency = read_u32(payload, offset) & 0x7FFFFFFF;
+        if (dependency == frame.stream_id) {
+            return build_rst_stream(frame.stream_id, H2Error::PROTOCOL_ERROR);
+        }
         offset += 5; // Stream dependency (4) + Weight (1)
     }
 
@@ -929,23 +1023,118 @@ std::string Http2Connection::handle_headers(const H2Frame& frame) {
         return build_goaway(H2Error::PROTOCOL_ERROR);
     }
 
-    auto header_data = payload.substr(offset, payload.size() - offset - pad_length);
-    stream.header_block.append(header_data);
-
-    if (frame.has_flag(H2Flags::END_HEADERS)) {
-        // Decode headers
-        auto header_bytes = std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(stream.header_block.data()),
-            stream.header_block.size()
-        );
-
-        auto decoded = decoder_.decode(header_bytes);
-        if (!decoded) {
-            return build_goaway(H2Error::COMPRESSION_ERROR);
+    auto it = streams_.find(frame.stream_id);
+    if (it == streams_.end()) {
+        // New stream: client-initiated IDs are odd and strictly increasing
+        if ((frame.stream_id & 1) == 0) {
+            return build_goaway(H2Error::PROTOCOL_ERROR, "Even stream id from client");
         }
+        if (frame.stream_id <= last_stream_id_) {
+            return build_goaway(H2Error::STREAM_CLOSED, "Stream already closed");
+        }
+        last_stream_id_ = frame.stream_id;
 
-        // Build HttpRequest from decoded headers
+        H2Stream stream;
+        stream.id = frame.stream_id;
+        stream.window_size = static_cast<int32_t>(initial_window_size_);
+        it = streams_.emplace(frame.stream_id, std::move(stream)).first;
+    } else if (it->second.state == H2StreamState::HALF_CLOSED_REMOTE ||
+               it->second.state == H2StreamState::CLOSED) {
+        return build_goaway(H2Error::STREAM_CLOSED, "HEADERS on half-closed stream");
+    }
+
+    auto& stream = it->second;
+    stream.header_block.assign(payload.substr(offset, payload.size() - offset - pad_length));
+    stream.header_block_end_stream = frame.has_flag(H2Flags::END_STREAM);
+
+    if (stream.header_block.size() > MAX_HEADER_BLOCK_SIZE) {
+        return build_goaway(H2Error::ENHANCE_YOUR_CALM, "Header block too large");
+    }
+
+    if (!frame.has_flag(H2Flags::END_HEADERS)) {
+        continuation_stream_id_ = frame.stream_id;
+        return {};
+    }
+
+    return finish_header_block(stream);
+}
+
+std::string Http2Connection::handle_continuation(const H2Frame& frame) {
+    if (frame.stream_id == 0 || frame.stream_id != continuation_stream_id_) {
+        return build_goaway(H2Error::PROTOCOL_ERROR, "Unexpected CONTINUATION");
+    }
+
+    auto it = streams_.find(frame.stream_id);
+    if (it == streams_.end()) {
+        return build_goaway(H2Error::PROTOCOL_ERROR);
+    }
+
+    auto& stream = it->second;
+    stream.header_block.append(frame.payload);
+    if (stream.header_block.size() > MAX_HEADER_BLOCK_SIZE) {
+        return build_goaway(H2Error::ENHANCE_YOUR_CALM, "Header block too large");
+    }
+
+    if (!frame.has_flag(H2Flags::END_HEADERS)) {
+        return {};
+    }
+
+    continuation_stream_id_ = 0;
+    return finish_header_block(stream);
+}
+
+std::string Http2Connection::finish_header_block(H2Stream& stream) {
+    // Always decode: the HPACK dynamic table must stay in sync even for refused streams
+    auto header_bytes = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(stream.header_block.data()),
+        stream.header_block.size());
+    auto decoded = decoder_.decode(header_bytes);
+    stream.header_block.clear();
+    stream.header_block.shrink_to_fit();
+
+    if (!decoded) {
+        return build_goaway(H2Error::COMPRESSION_ERROR);
+    }
+
+    const uint32_t stream_id = stream.id;
+    const bool end_stream = stream.header_block_end_stream;
+
+    if (stream.headers_complete) {
+        // Trailer section: must end the stream and must not contain pseudo-headers
+        if (!end_stream) {
+            return build_goaway(H2Error::PROTOCOL_ERROR, "Trailers without END_STREAM");
+        }
         for (const auto& [name, value] : *decoded) {
+            if (name.empty() || name[0] == ':') {
+                streams_.erase(stream_id);
+                return build_rst_stream(stream_id, H2Error::PROTOCOL_ERROR);
+            }
+            stream.request.headers[name] = value;
+        }
+        stream.state = H2StreamState::HALF_CLOSED_REMOTE;
+        return dispatch_request(stream);
+    }
+
+    // Enforce our advertised concurrency limit
+    size_t active = 0;
+    for (const auto& [sid, s] : streams_) {
+        if (!s.response_done) ++active;
+    }
+    if (active > LOCAL_MAX_CONCURRENT_STREAMS) {
+        streams_.erase(stream_id);
+        return build_rst_stream(stream_id, H2Error::REFUSED_STREAM);
+    }
+
+    // Build HttpRequest from decoded headers
+    bool has_scheme = false;
+    bool regular_seen = false;
+    for (const auto& [name, value] : *decoded) {
+        if (!name.empty() && name[0] == ':') {
+            // Pseudo-headers must precede regular headers
+            if (regular_seen) {
+                streams_.erase(stream_id);
+                return build_rst_stream(stream_id, H2Error::PROTOCOL_ERROR);
+            }
             if (name == ":method") stream.request.method_str = value;
             else if (name == ":path") {
                 stream.request.uri = value;
@@ -957,42 +1146,186 @@ std::string Http2Connection::handle_headers(const H2Frame& frame) {
                 }
             }
             else if (name == ":authority") stream.request.headers["Host"] = value;
-            else if (name == ":scheme") {} // Not needed for routing
-            else if (!name.empty() && name[0] != ':') {
-                stream.request.headers[name] = value;
+            else if (name == ":scheme") has_scheme = true;
+            else {
+                // Unknown pseudo-header (e.g. :protocol without extended CONNECT support)
+                streams_.erase(stream_id);
+                return build_rst_stream(stream_id, H2Error::PROTOCOL_ERROR);
             }
+            continue;
         }
 
-        // Parse method
-        if (stream.request.method_str == "GET") stream.request.method = HttpMethod::GET;
-        else if (stream.request.method_str == "POST") stream.request.method = HttpMethod::POST;
-        else if (stream.request.method_str == "HEAD") stream.request.method = HttpMethod::HEAD;
-        else if (stream.request.method_str == "PUT") stream.request.method = HttpMethod::PUT;
-        else if (stream.request.method_str == "DELETE") stream.request.method = HttpMethod::DELETE_;
-        else if (stream.request.method_str == "OPTIONS") stream.request.method = HttpMethod::OPTIONS;
-        else stream.request.method = HttpMethod::UNKNOWN;
+        regular_seen = true;
+        auto lower = to_lower_copy(name);
+        if (lower != name || is_connection_specific_header(lower) ||
+            (lower == "te" && value != "trailers")) {
+            // Uppercase names and connection-specific fields are malformed in HTTP/2
+            streams_.erase(stream_id);
+            return build_rst_stream(stream_id, H2Error::PROTOCOL_ERROR);
+        }
 
-        stream.request.version = "HTTP/2";
-        stream.headers_complete = true;
-        stream.header_block.clear();
-
-        // If END_STREAM, process request immediately
-        if (frame.has_flag(H2Flags::END_STREAM)) {
-            stream.state = H2StreamState::HALF_CLOSED_REMOTE;
-
-            // Handle request
-            auto response = handler_(stream.request);
-            LOG_INFO("HTTP/2 stream " + std::to_string(frame.stream_id) + " " +
-                     stream.request.method_str + " " + stream.request.uri +
-                     " -> " + std::to_string(response.status_code));
-
-            return build_headers_response(frame.stream_id, response);
+        auto existing = stream.request.headers.find(lower);
+        if (existing == stream.request.headers.end()) {
+            stream.request.headers.emplace(std::move(lower), value);
+        } else if (lower == "cookie") {
+            // Split cookie fields are rejoined with "; " (RFC 9113 Section 8.2.3)
+            existing->second += "; " + value;
         } else {
-            stream.state = H2StreamState::OPEN;
+            existing->second += ", " + value;
         }
     }
 
+    stream.request.method = parse_method(stream.request.method_str);
+    if (stream.request.method_str.empty() ||
+        (stream.request.method_str != "CONNECT" && (stream.request.uri.empty() || !has_scheme))) {
+        // Mandatory pseudo-headers missing: malformed request
+        streams_.erase(stream_id);
+        return build_rst_stream(stream_id, H2Error::PROTOCOL_ERROR);
+    }
+
+    stream.request.version = "HTTP/2";
+    stream.headers_complete = true;
+
+    if (end_stream) {
+        stream.state = H2StreamState::HALF_CLOSED_REMOTE;
+        return dispatch_request(stream);
+    }
+
+    stream.state = H2StreamState::OPEN;
     return {};
+}
+
+std::string Http2Connection::dispatch_request(H2Stream& stream) {
+    if (stream.request_dispatched) return {};
+    stream.request_dispatched = true;
+
+    auto response = handler_(stream.request);
+    LOG_DEBUG("HTTP/2 stream " + std::to_string(stream.id) + " " +
+              stream.request.method_str + " " + stream.request.uri +
+              " -> " + std::to_string(response.status_code));
+
+    return queue_response(stream, response);
+}
+
+std::string Http2Connection::queue_response(H2Stream& stream, const HttpResponse& resp) {
+    // Encode response headers
+    std::vector<std::pair<std::string, std::string>> headers;
+    headers.emplace_back(":status", std::to_string(resp.status_code));
+
+    bool has_content_length = false;
+    for (const auto& [name, value] : resp.headers) {
+        auto lower_name = to_lower_copy(name);
+        if (lower_name.empty() || lower_name[0] == ':' || is_connection_specific_header(lower_name)) {
+            continue;
+        }
+        if (lower_name == "content-length") has_content_length = true;
+        headers.emplace_back(std::move(lower_name), value);
+    }
+
+    const bool no_body = status_forbids_body(resp.status_code);
+    const bool is_head = (stream.request.method == HttpMethod::HEAD);
+
+    if (!resp.body.empty() && !has_content_length && !no_body) {
+        headers.emplace_back("content-length", std::to_string(resp.body.size()));
+    }
+
+    stream.response_queued = true;
+    stream.out_offset = 0;
+    stream.out_data = (no_body || is_head) ? std::string() : resp.body;
+    stream.out_trailers.clear();
+    for (const auto& [name, value] : resp.trailers) {
+        auto lower_name = to_lower_copy(name);
+        if (lower_name.empty() || lower_name[0] == ':' || is_connection_specific_header(lower_name)) {
+            continue;
+        }
+        stream.out_trailers.emplace_back(std::move(lower_name), value);
+    }
+
+    const bool headers_end_stream = stream.out_data.empty() && stream.out_trailers.empty();
+    std::string output = build_header_frames(stream.id, encoder_.encode(headers), headers_end_stream);
+
+    if (headers_end_stream) {
+        stream.response_done = true;
+        uint32_t id = stream.id;
+        if (stream.state == H2StreamState::OPEN) {
+            // Response complete before the request body: tell the client to stop sending
+            output += build_rst_stream(id, H2Error::NO_ERROR);
+            streams_.erase(id);
+        } else {
+            erase_stream_if_finished(id);
+        }
+        return output;
+    }
+
+    output += flush_stream(stream);
+    return output;
+}
+
+std::string Http2Connection::flush_stream(H2Stream& stream) {
+    std::string output;
+    if (!stream.response_queued || stream.response_done) return output;
+
+    // Send as much DATA as both flow-control windows allow
+    while (stream.out_offset < stream.out_data.size()) {
+        int64_t allowed = std::min<int64_t>(stream.window_size, connection_window_);
+        if (allowed <= 0) return output; // Wait for WINDOW_UPDATE
+
+        size_t remaining = stream.out_data.size() - stream.out_offset;
+        size_t chunk = std::min({remaining, static_cast<size_t>(allowed), static_cast<size_t>(max_frame_size_)});
+        bool last = (chunk == remaining);
+        uint8_t flags = (last && stream.out_trailers.empty()) ? H2Flags::END_STREAM : 0;
+
+        output += build_frame(H2FrameType::DATA, flags, stream.id,
+                              std::string_view(stream.out_data.data() + stream.out_offset, chunk));
+        stream.out_offset += chunk;
+        stream.window_size -= static_cast<int32_t>(chunk);
+        connection_window_ -= static_cast<int32_t>(chunk);
+    }
+
+    if (!stream.out_trailers.empty()) {
+        output += build_header_frames(stream.id, encoder_.encode(stream.out_trailers), true);
+        stream.out_trailers.clear();
+    }
+
+    stream.response_done = true;
+    stream.out_data.clear();
+    stream.out_data.shrink_to_fit();
+
+    uint32_t id = stream.id;
+    if (stream.state == H2StreamState::OPEN) {
+        output += build_rst_stream(id, H2Error::NO_ERROR);
+        streams_.erase(id);
+    } else {
+        erase_stream_if_finished(id);
+    }
+    return output;
+}
+
+std::string Http2Connection::flush_all() {
+    // Collect ids first: flushing may erase finished streams
+    std::vector<uint32_t> ids;
+    ids.reserve(streams_.size());
+    for (const auto& [id, stream] : streams_) {
+        if (stream.response_queued && !stream.response_done) ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+
+    std::string output;
+    for (uint32_t id : ids) {
+        if (connection_window_ <= 0) break;
+        auto it = streams_.find(id);
+        if (it != streams_.end()) output += flush_stream(it->second);
+    }
+    return output;
+}
+
+void Http2Connection::erase_stream_if_finished(uint32_t stream_id) {
+    auto it = streams_.find(stream_id);
+    if (it == streams_.end()) return;
+    const auto& stream = it->second;
+    if (stream.response_done && stream.state == H2StreamState::HALF_CLOSED_REMOTE) {
+        streams_.erase(it);
+    }
 }
 
 std::string Http2Connection::handle_data(const H2Frame& frame) {
@@ -1000,34 +1333,61 @@ std::string Http2Connection::handle_data(const H2Frame& frame) {
         return build_goaway(H2Error::PROTOCOL_ERROR);
     }
 
+    std::string_view payload(frame.payload);
+    size_t pad_length = 0;
+    if (frame.has_flag(H2Flags::PADDED)) {
+        if (payload.empty()) return build_goaway(H2Error::PROTOCOL_ERROR);
+        pad_length = static_cast<uint8_t>(payload[0]);
+        if (pad_length + 1 > payload.size()) return build_goaway(H2Error::PROTOCOL_ERROR);
+        payload = payload.substr(1, payload.size() - 1 - pad_length);
+    }
+
+    std::string output;
+    // Replenish the connection-level receive window for every DATA frame (padding included)
+    if (frame.length > 0) {
+        output += build_window_update(0, frame.length);
+    }
+
     auto it = streams_.find(frame.stream_id);
     if (it == streams_.end()) {
-        return build_goaway(H2Error::PROTOCOL_ERROR);
+        if (frame.stream_id > last_stream_id_) {
+            // DATA on an idle stream is a connection error
+            return output + build_goaway(H2Error::PROTOCOL_ERROR, "DATA on idle stream");
+        }
+        // Stream already finished/reset by us: stream error only
+        return output + build_rst_stream(frame.stream_id, H2Error::STREAM_CLOSED);
     }
 
     auto& stream = it->second;
-    stream.request.body.append(frame.payload);
+    if (stream.state != H2StreamState::OPEN || !stream.headers_complete) {
+        // DATA after END_STREAM: stream error STREAM_CLOSED (RFC 9113 Section 5.1)
+        streams_.erase(it);
+        return output + build_rst_stream(frame.stream_id, H2Error::STREAM_CLOSED);
+    }
+
+    if (stream.request.body.size() + payload.size() > max_request_body_) {
+        // Request body too large: answer 413 and stop the stream
+        stream.state = H2StreamState::HALF_CLOSED_REMOTE;
+        stream.request_dispatched = true;
+        output += queue_response(stream, HttpResponse::make_error(413, "Payload Too Large"));
+        if (streams_.count(frame.stream_id)) {
+            output += build_rst_stream(frame.stream_id, H2Error::NO_ERROR);
+            streams_.erase(frame.stream_id);
+        }
+        return output;
+    }
+
+    stream.request.body.append(payload);
 
     if (frame.has_flag(H2Flags::END_STREAM)) {
         stream.state = H2StreamState::HALF_CLOSED_REMOTE;
-
-        if (stream.headers_complete) {
-            auto response = handler_(stream.request);
-            return build_headers_response(frame.stream_id, response);
-        }
+        output += dispatch_request(stream);
+        return output;
     }
 
-    // Send WINDOW_UPDATE for connection and stream
-    std::string output;
+    // Stream-level receive window update (only while the peer may still send)
     if (frame.length > 0) {
-        uint32_t increment = frame.length;
-        // Connection-level window update
-        char buf[4];
-        uint32_t net_inc = htonl(increment);
-        std::memcpy(buf, &net_inc, 4);
-        output += build_frame(H2FrameType::WINDOW_UPDATE, 0, 0, std::string_view(buf, 4));
-        // Stream-level window update
-        output += build_frame(H2FrameType::WINDOW_UPDATE, 0, frame.stream_id, std::string_view(buf, 4));
+        output += build_window_update(frame.stream_id, frame.length);
     }
 
     return output;
@@ -1038,28 +1398,57 @@ std::string Http2Connection::handle_window_update(const H2Frame& frame) {
         return build_goaway(H2Error::FRAME_SIZE_ERROR);
     }
 
-    uint32_t increment = (static_cast<uint32_t>(static_cast<uint8_t>(frame.payload[0]) & 0x7F) << 24) |
-                         (static_cast<uint32_t>(static_cast<uint8_t>(frame.payload[1])) << 16) |
-                         (static_cast<uint32_t>(static_cast<uint8_t>(frame.payload[2])) << 8) |
-                         static_cast<uint32_t>(static_cast<uint8_t>(frame.payload[3]));
-
-    if (increment == 0) {
-        return build_goaway(H2Error::PROTOCOL_ERROR);
-    }
+    uint32_t increment = read_u32(frame.payload, 0) & 0x7FFFFFFF;
 
     if (frame.stream_id == 0) {
-        connection_window_ += static_cast<int32_t>(increment);
-    } else {
-        auto it = streams_.find(frame.stream_id);
-        if (it != streams_.end()) {
-            it->second.window_size += static_cast<int32_t>(increment);
-        }
+        if (increment == 0) return build_goaway(H2Error::PROTOCOL_ERROR);
+        int64_t updated = static_cast<int64_t>(connection_window_) + increment;
+        if (updated > 0x7FFFFFFF) return build_goaway(H2Error::FLOW_CONTROL_ERROR);
+        connection_window_ = static_cast<int32_t>(updated);
+        return flush_all();
     }
 
+    auto it = streams_.find(frame.stream_id);
+    if (it == streams_.end()) {
+        if (frame.stream_id > last_stream_id_) {
+            return build_goaway(H2Error::PROTOCOL_ERROR, "WINDOW_UPDATE on idle stream");
+        }
+        return {}; // Closed stream: ignore
+    }
+
+    if (increment == 0) {
+        streams_.erase(it);
+        return build_rst_stream(frame.stream_id, H2Error::PROTOCOL_ERROR);
+    }
+
+    int64_t updated = static_cast<int64_t>(it->second.window_size) + increment;
+    if (updated > 0x7FFFFFFF) {
+        streams_.erase(it);
+        return build_rst_stream(frame.stream_id, H2Error::FLOW_CONTROL_ERROR);
+    }
+    it->second.window_size = static_cast<int32_t>(updated);
+    return flush_stream(it->second);
+}
+
+std::string Http2Connection::handle_rst_stream(const H2Frame& frame) {
+    if (frame.stream_id == 0) {
+        return build_goaway(H2Error::PROTOCOL_ERROR, "RST_STREAM on stream 0");
+    }
+    if (frame.payload.size() != 4) {
+        return build_goaway(H2Error::FRAME_SIZE_ERROR);
+    }
+    if (frame.stream_id > last_stream_id_) {
+        return build_goaway(H2Error::PROTOCOL_ERROR, "RST_STREAM on idle stream");
+    }
+    // Peer cancelled the stream: drop any queued response
+    streams_.erase(frame.stream_id);
     return {};
 }
 
 std::string Http2Connection::handle_ping(const H2Frame& frame) {
+    if (frame.stream_id != 0) {
+        return build_goaway(H2Error::PROTOCOL_ERROR);
+    }
     if (frame.payload.size() != 8) {
         return build_goaway(H2Error::FRAME_SIZE_ERROR);
     }
@@ -1114,62 +1503,46 @@ std::string Http2Connection::build_settings_frame(bool ack) {
         payload.append(reinterpret_cast<const char*>(&net_val), 4);
     };
 
-    add_setting(H2Setting::MAX_CONCURRENT_STREAMS, 100);
-    add_setting(H2Setting::INITIAL_WINDOW_SIZE, 65535);
-    add_setting(H2Setting::MAX_FRAME_SIZE, 16384);
+    add_setting(H2Setting::ENABLE_PUSH, 0);
+    add_setting(H2Setting::MAX_CONCURRENT_STREAMS, LOCAL_MAX_CONCURRENT_STREAMS);
+    add_setting(H2Setting::INITIAL_WINDOW_SIZE, LOCAL_INITIAL_WINDOW_SIZE);
+    add_setting(H2Setting::MAX_FRAME_SIZE, LOCAL_MAX_FRAME_SIZE);
+    add_setting(H2Setting::MAX_HEADER_LIST_SIZE, static_cast<uint32_t>(MAX_HEADER_BLOCK_SIZE));
 
     return build_frame(H2FrameType::SETTINGS, 0, 0, payload);
 }
 
-std::string Http2Connection::build_headers_response(uint32_t stream_id, const HttpResponse& resp) {
+std::string Http2Connection::build_header_frames(uint32_t stream_id, std::string_view block,
+                                                 bool end_stream) const {
+    // Split the header block into HEADERS + CONTINUATION frames that fit the peer's frame size
     std::string output;
-
-    // Encode response headers
-    std::vector<std::pair<std::string, std::string>> headers;
-    headers.emplace_back(":status", std::to_string(resp.status_code));
-
-    for (const auto& [name, value] : resp.headers) {
-        std::string lower_name(name);
-        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        headers.emplace_back(std::move(lower_name), value);
-    }
-
-    if (!resp.body.empty()) {
-        bool has_cl = false;
-        for (const auto& [n, v] : headers) {
-            if (n == "content-length") { has_cl = true; break; }
-        }
-        if (!has_cl) {
-            headers.emplace_back("content-length", std::to_string(resp.body.size()));
-        }
-    }
-
-    headers.emplace_back("server", "JustServer/1.0");
-
-    auto encoded = encoder_.encode(headers);
-
-    uint8_t flags = H2Flags::END_HEADERS;
-    if (resp.body.empty()) {
-        flags |= H2Flags::END_STREAM;
-    }
-
-    output += build_frame(H2FrameType::HEADERS, flags, stream_id, encoded);
-
-    // Send body as DATA frames
-    if (!resp.body.empty()) {
-        size_t offset = 0;
-        while (offset < resp.body.size()) {
-            size_t chunk = std::min(resp.body.size() - offset, static_cast<size_t>(max_frame_size_));
-            bool last = (offset + chunk >= resp.body.size());
-            uint8_t data_flags = last ? H2Flags::END_STREAM : 0;
-            output += build_frame(H2FrameType::DATA, data_flags, stream_id,
-                                  std::string_view(resp.body.data() + offset, chunk));
-            offset += chunk;
-        }
-    }
-
+    size_t offset = 0;
+    bool first = true;
+    do {
+        size_t chunk = std::min(block.size() - offset, static_cast<size_t>(max_frame_size_));
+        bool last = (offset + chunk >= block.size());
+        uint8_t flags = last ? H2Flags::END_HEADERS : 0;
+        if (first && end_stream) flags |= H2Flags::END_STREAM;
+        output += build_frame(first ? H2FrameType::HEADERS : H2FrameType::CONTINUATION,
+                              flags, stream_id, block.substr(offset, chunk));
+        offset += chunk;
+        first = false;
+    } while (offset < block.size());
     return output;
+}
+
+std::string Http2Connection::build_rst_stream(uint32_t stream_id, H2Error error) {
+    char buf[4];
+    uint32_t net = htonl(static_cast<uint32_t>(error));
+    std::memcpy(buf, &net, 4);
+    return build_frame(H2FrameType::RST_STREAM, 0, stream_id, std::string_view(buf, 4));
+}
+
+std::string Http2Connection::build_window_update(uint32_t stream_id, uint32_t increment) {
+    char buf[4];
+    uint32_t net = htonl(increment & 0x7FFFFFFF);
+    std::memcpy(buf, &net, 4);
+    return build_frame(H2FrameType::WINDOW_UPDATE, 0, stream_id, std::string_view(buf, 4));
 }
 
 std::string Http2Connection::build_goaway(H2Error error, std::string_view debug) {
@@ -1187,21 +1560,6 @@ std::string Http2Connection::build_goaway(H2Error error, std::string_view debug)
     }
 
     return build_frame(H2FrameType::GOAWAY, 0, 0, payload);
-}
-
-H2Stream& Http2Connection::get_or_create_stream(uint32_t stream_id) {
-    auto it = streams_.find(stream_id);
-    if (it == streams_.end()) {
-        auto [new_it, _] = streams_.emplace(stream_id, H2Stream{});
-        new_it->second.id = stream_id;
-        new_it->second.state = H2StreamState::IDLE;
-        new_it->second.window_size = static_cast<int32_t>(initial_window_size_);
-        if (stream_id > last_stream_id_) {
-            last_stream_id_ = stream_id;
-        }
-        return new_it->second;
-    }
-    return it->second;
 }
 
 } // namespace js

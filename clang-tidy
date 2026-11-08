@@ -1,0 +1,26 @@
+# clang-tidy configuration for JustServer (Clang 23).
+#
+# Usage (needs build/compile_commands.json, created by the CMake configure step):
+#   cmake -S . -B build -DCMAKE_CXX_COMPILER=clang++-23 -DBUILD_TESTS=OFF -DBUILD_FUZZ=OFF
+#   clang-tidy-23 -p build src/*.cpp
+#
+# Focus: bugs, CERT rules, static-analyzer paths and thread-safety. Style checks
+# (readability-*, modernize-*) are intentionally off.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -cert-err33-c,
+  -clang-analyzer-optin.performance.Padding
+
+# Report diagnostics only from this project's own headers (not /usr/include).
+# Adjust the directory name if the repository is checked out under another name.
+HeaderFilterRegex: '(^|/)(JustServer|justserver)/(src|include)/'
+
+# Findings are advisory for now; do not fail the run on warnings.
+WarningsAsErrors: ''

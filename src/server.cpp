@@ -467,39 +467,52 @@ bool Server::apply_security() {
     }
 
     // --- Chroot if enabled (must be root, must happen before privilege drop) ---
+    // Fail closed: if the operator asked for a chroot we must not keep running
+    // unjailed. chdir("/") is mandatory right after chroot(), otherwise the
+    // working directory stays outside the jail (classic chroot escape).
     if (config_.chroot_enabled) {
         if (chroot(config_.document_root.c_str()) != 0) {
-            LOG_WARN("Failed to chroot (requires root): " + std::string(strerror(errno)));
-        } else {
-            LOG_INFO("Chroot to: " + config_.document_root.string());
-            config_.document_root = "/";
+            LOG_ERROR("Failed to chroot (requires root): " + std::string(strerror(errno)));
+            return false;
         }
+        if (chdir("/") != 0) {
+            LOG_ERROR("chdir(\"/\") after chroot failed: " + std::string(strerror(errno)));
+            return false;
+        }
+        LOG_INFO("Chroot to: " + config_.document_root.string());
+        config_.document_root = "/";
     }
 
-    // --- Drop privileges: setgid then setuid (order matters!) ---
+    // --- Drop privileges: setgroups, setgid, then setuid (order matters!) ---
     // This must happen AFTER bind(), TLS cert loading, and chroot().
+    // Fail closed: a failed drop must never leave the server running as root.
     if (config_.drop_gid >= 0) {
         gid_t gid = static_cast<gid_t>(config_.drop_gid);
         if (setgroups(0, nullptr) != 0) {
-            LOG_WARN("Failed to clear supplementary groups: " + std::string(strerror(errno)));
+            if (geteuid() == 0) {
+                LOG_ERROR("Failed to clear supplementary groups: " + std::string(strerror(errno)));
+                return false;
+            }
+            // Not root: clearing groups is not permitted (EPERM), keep going.
+            LOG_WARN("Cannot clear supplementary groups (not root): " + std::string(strerror(errno)));
         }
         if (setgid(gid) != 0) {
-            LOG_WARN("Failed to setgid(" + std::to_string(gid) + "): " + std::string(strerror(errno)));
-        } else {
-            LOG_INFO("Dropped group privileges to GID " + std::to_string(gid));
+            LOG_ERROR("Failed to setgid(" + std::to_string(gid) + "): " + std::string(strerror(errno)));
+            return false;
         }
+        LOG_INFO("Dropped group privileges to GID " + std::to_string(gid));
     }
     if (config_.drop_uid >= 0) {
         uid_t uid = static_cast<uid_t>(config_.drop_uid);
         if (setuid(uid) != 0) {
-            LOG_WARN("Failed to setuid(" + std::to_string(uid) + "): " + std::string(strerror(errno)));
-        } else {
-            LOG_INFO("Dropped user privileges to UID " + std::to_string(uid));
-            // Verify we cannot re-escalate
-            if (setuid(0) == 0) {
-                LOG_ERROR("CRITICAL: was able to regain root after setuid -- aborting");
-                return false;
-            }
+            LOG_ERROR("Failed to setuid(" + std::to_string(uid) + "): " + std::string(strerror(errno)));
+            return false;
+        }
+        LOG_INFO("Dropped user privileges to UID " + std::to_string(uid));
+        // Verify we cannot re-escalate
+        if (setuid(0) == 0) {
+            LOG_ERROR("CRITICAL: was able to regain root after setuid -- aborting");
+            return false;
         }
     }
 
